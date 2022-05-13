@@ -40,7 +40,7 @@ mod options {
 static ABOUT: &str = "Print information about users who are currently logged in.";
 const USAGE: &str = "{} [OPTION]... [ FILE | ARG1 ARG2 ]";
 
-#[cfg(any(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 static RUNLEVEL_HELP: &str = "print current runlevel";
 #[cfg(not(target_os = "linux"))]
 static RUNLEVEL_HELP: &str = "print current runlevel (This is meaningless on non Linux)";
@@ -275,10 +275,10 @@ struct Who {
 
 fn idle_string<'a>(when: i64, boottime: i64) -> Cow<'a, str> {
     thread_local! {
-        static NOW: time::Tm = time::now()
+        static NOW: time::OffsetDateTime = time::OffsetDateTime::now_local().unwrap();
     }
     NOW.with(|n| {
-        let now = n.to_timespec().sec;
+        let now = n.unix_timestamp();
         if boottime < when && now - 24 * 3600 < when && when <= now {
             let seconds_idle = now - when;
             if seconds_idle < 60 {
@@ -298,7 +298,11 @@ fn idle_string<'a>(when: i64, boottime: i64) -> Cow<'a, str> {
 }
 
 fn time_string(ut: &Utmpx) -> String {
-    time::strftime("%b %e %H:%M", &ut.login_time()).unwrap() // LC_ALL=C
+    // "%b %e %H:%M"
+    let time_format: Vec<time::format_description::FormatItem> =
+        time::format_description::parse("[month repr:short] [day padding:space] [hour]:[minute]")
+            .unwrap();
+    ut.login_time().format(&time_format).unwrap() // LC_ALL=C
 }
 
 #[inline]

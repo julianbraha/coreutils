@@ -9,15 +9,17 @@
 
 //! Set of functions to manage file systems
 
-// spell-checker:ignore (arch) bitrig ; (fs) cifs smbfs
+// spell-checker:ignore DATETIME subsecond (arch) bitrig ; (fs) cifs smbfs
 
 extern crate time;
+use time::macros::format_description;
+use time::UtcOffset;
 
 pub use crate::*; // import macros from `../../macros.rs`
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const LINUX_MTAB: &str = "/etc/mtab";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const LINUX_MOUNTINFO: &str = "/proc/self/mountinfo";
 static MOUNT_OPT_BIND: &str = "bind";
 #[cfg(windows)]
@@ -63,7 +65,6 @@ fn LPWSTR2String(buf: &[u16]) -> String {
     String::from_utf16(&buf[..len]).unwrap()
 }
 
-use self::time::Timespec;
 #[cfg(unix)]
 use libc::{
     mode_t, strerror, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
@@ -75,7 +76,8 @@ use std::convert::{AsRef, From};
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "linux"
+    target_os = "linux",
+    target_os = "android",
 ))]
 use std::ffi::CStr;
 #[cfg(not(windows))]
@@ -83,13 +85,14 @@ use std::ffi::CString;
 use std::io::Error as IOError;
 #[cfg(unix)]
 use std::mem;
+#[cfg(not(unix))]
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 #[cfg(any(
     target_os = "linux",
-    target_vendor = "apple",
     target_os = "android",
+    target_vendor = "apple",
     target_os = "freebsd",
     target_os = "openbsd"
 ))]
@@ -106,8 +109,8 @@ pub use libc::statvfs as StatFs;
 
 #[cfg(any(
     target_os = "linux",
-    target_vendor = "apple",
     target_os = "android",
+    target_vendor = "apple",
     target_os = "freebsd",
     target_os = "openbsd",
     target_os = "redox"
@@ -208,7 +211,7 @@ impl MountInfo {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn new(file_name: &str, raw: &[&str]) -> Option<Self> {
         match file_name {
             // spell-checker:ignore (word) noatime
@@ -382,9 +385,9 @@ extern "C" {
     fn get_mount_info(mount_buffer_p: *mut *mut StatFs, flags: c_int) -> c_int;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::fs::File;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::io::{BufRead, BufReader};
 #[cfg(any(
     target_vendor = "apple",
@@ -403,7 +406,7 @@ use std::ptr;
 use std::slice;
 /// Read file system list.
 pub fn read_fs_list() -> Vec<MountInfo> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let (file_name, f) = File::open(LINUX_MOUNTINFO)
             .map(|f| (LINUX_MOUNTINFO, f))
@@ -611,17 +614,27 @@ impl FsMeta for StatFs {
     fn free_file_nodes(&self) -> u64 {
         self.f_ffree as u64
     }
-    #[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "freebsd"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    ))]
     fn fs_type(&self) -> i64 {
         self.f_type as i64
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )))]
     fn fs_type(&self) -> i64 {
         // FIXME: statvfs doesn't have an equivalent, so we need to do something else
         unimplemented!()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn io_size(&self) -> u64 {
         self.f_frsize as u64
     }
@@ -634,6 +647,7 @@ impl FsMeta for StatFs {
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "linux",
+        target_os = "android",
         target_os = "netbsd"
     )))]
     fn io_size(&self) -> u64 {
@@ -650,24 +664,26 @@ impl FsMeta for StatFs {
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "linux",
+        target_os = "android",
         target_os = "openbsd"
     ))]
     fn fsid(&self) -> u64 {
         let f_fsid: &[u32; 2] =
-            unsafe { &*(&self.f_fsid as *const libc::fsid_t as *const [u32; 2]) };
+            unsafe { &*(&self.f_fsid as *const nix::sys::statfs::fsid_t as *const [u32; 2]) };
         (u64::from(f_fsid[0])) << 32 | u64::from(f_fsid[1])
     }
     #[cfg(not(any(
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "linux",
+        target_os = "android",
         target_os = "openbsd"
     )))]
     fn fsid(&self) -> u64 {
         self.f_fsid as u64
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn namelen(&self) -> u64 {
         self.f_namelen as u64
     }
@@ -684,6 +700,7 @@ impl FsMeta for StatFs {
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "linux",
+        target_os = "android",
         target_os = "netbsd",
         target_os = "openbsd"
     )))]
@@ -693,9 +710,9 @@ impl FsMeta for StatFs {
 }
 
 #[cfg(unix)]
-pub fn statfs<P: AsRef<Path>>(path: P) -> Result<StatFs, String>
+pub fn statfs<P>(path: P) -> Result<StatFs, String>
 where
-    Vec<u8>: From<P>,
+    P: Into<Vec<u8>>,
 {
     match CString::new(path) {
         Ok(p) => {
@@ -717,11 +734,42 @@ where
     }
 }
 
+// match strftime "%Y-%m-%d %H:%M:%S.%f %z"
+const PRETTY_DATETIME_FORMAT: &[time::format_description::FormatItem] = format_description!(
+    "\
+[year]-[month]-[day padding:zero] \
+[hour]:[minute]:[second].[subsecond digits:9] \
+[offset_hour sign:mandatory][offset_minute]"
+);
+
 pub fn pretty_time(sec: i64, nsec: i64) -> String {
     // sec == seconds since UNIX_EPOCH
     // nsec == nanoseconds since (UNIX_EPOCH + sec)
-    let tm = time::at(Timespec::new(sec, nsec as i32));
-    let res = time::strftime("%Y-%m-%d %H:%M:%S.%f %z", &tm).unwrap();
+    let ts_nanos: i128 = (sec * 1_000_000_000 + nsec).into();
+
+    // Return the date in UTC
+    let tm = match time::OffsetDateTime::from_unix_timestamp_nanos(ts_nanos) {
+        Ok(tm) => tm,
+        Err(e) => {
+            panic!("error: {}", e);
+        }
+    };
+
+    // Get the offset to convert to local time
+    // Because of DST (daylight saving), we get the local time back when
+    // the date was set
+    let local_offset = match UtcOffset::local_offset_at(tm) {
+        Ok(lo) => lo,
+        Err(e) => {
+            panic!("error: {}", e);
+        }
+    };
+
+    // Include the conversion to local time
+    let res = tm
+        .to_offset(local_offset)
+        .format(&PRETTY_DATETIME_FORMAT)
+        .unwrap();
     if res.ends_with(" -0000") {
         res.replace(" -0000", " +0000")
     } else {
@@ -903,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_mountinfo() {
         // spell-checker:ignore (word) relatime
         let info = MountInfo::new(

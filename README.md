@@ -52,8 +52,6 @@ Both can also be generated locally, the instructions for that can be found in th
 uutils follows Rust's release channels and is tested against stable, beta and nightly.
 The current oldest supported version of the Rust compiler is `1.56`.
 
-On both Windows and Redox, only the nightly version is tested currently.
-
 ## Building
 
 There are currently two methods to build the uutils binaries: either Cargo
@@ -385,6 +383,7 @@ To improve the GNU compatibility, the following process is recommended:
 1. Start to modify `<your test>` to understand what is wrong. Examples:
     1. Add `set -v` to have the bash verbose mode
     1. Add `echo $?` where needed
+    1. When the variable `fail` is used in the test, `echo $fail` to see when the test started to fail
     1. Bump the content of the output (ex: `cat err`)
     1. ...
 1. Or, if the test is simple, extract the relevant information to create a new test case running both GNU & Rust implementation

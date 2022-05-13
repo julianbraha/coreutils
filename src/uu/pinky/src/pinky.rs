@@ -221,10 +221,10 @@ impl Capitalize for str {
 
 fn idle_string(when: i64) -> String {
     thread_local! {
-        static NOW: time::Tm = time::now()
+        static NOW: time::OffsetDateTime = time::OffsetDateTime::now_local().unwrap();
     }
     NOW.with(|n| {
-        let duration = n.to_timespec().sec - when;
+        let duration = n.unix_timestamp() - when;
         if duration < 60 {
             // less than 1min
             "     ".to_owned()
@@ -242,15 +242,23 @@ fn idle_string(when: i64) -> String {
 }
 
 fn time_string(ut: &Utmpx) -> String {
-    time::strftime("%b %e %H:%M", &ut.login_time()).unwrap() // LC_ALL=C
+    // "%b %e %H:%M"
+    let time_format: Vec<time::format_description::FormatItem> =
+        time::format_description::parse("[month repr:short] [day padding:space] [hour]:[minute]")
+            .unwrap();
+    ut.login_time().format(&time_format).unwrap() // LC_ALL=C
 }
 
-fn gecos_to_fullname(pw: &Passwd) -> String {
-    let mut gecos = pw.user_info.clone();
+fn gecos_to_fullname(pw: &Passwd) -> Option<String> {
+    let mut gecos = if let Some(gecos) = &pw.user_info {
+        gecos.clone()
+    } else {
+        return None;
+    };
     if let Some(n) = gecos.find(',') {
         gecos.truncate(n);
     }
-    gecos.replace('&', &pw.name.capitalize())
+    Some(gecos.replace('&', &pw.name.capitalize()))
 }
 
 impl Pinky {
@@ -278,8 +286,13 @@ impl Pinky {
         print!("{1:<8.0$}", utmpx::UT_NAMESIZE, ut.user());
 
         if self.include_fullname {
-            if let Ok(pw) = Passwd::locate(ut.user().as_ref()) {
-                print!(" {:<19.19}", gecos_to_fullname(&pw));
+            let fullname = if let Ok(pw) = Passwd::locate(ut.user().as_ref()) {
+                gecos_to_fullname(&pw)
+            } else {
+                None
+            };
+            if let Some(fullname) = fullname {
+                print!(" {:<19.19}", fullname);
             } else {
                 print!(" {:19}", "        ???");
             }
@@ -341,13 +354,16 @@ impl Pinky {
         for u in &self.names {
             print!("Login name: {:<28}In real life: ", u);
             if let Ok(pw) = Passwd::locate(u.as_str()) {
-                println!(" {}", gecos_to_fullname(&pw));
+                let fullname = gecos_to_fullname(&pw).unwrap_or_default();
+                let user_dir = pw.user_dir.unwrap_or_default();
+                let user_shell = pw.user_shell.unwrap_or_default();
+                println!(" {}", fullname);
                 if self.include_home_and_shell {
-                    print!("Directory: {:<29}", pw.user_dir);
-                    println!("Shell:  {}", pw.user_shell);
+                    print!("Directory: {:<29}", user_dir);
+                    println!("Shell:  {}", user_shell);
                 }
                 if self.include_project {
-                    let mut p = PathBuf::from(&pw.user_dir);
+                    let mut p = PathBuf::from(&user_dir);
                     p.push(".project");
                     if let Ok(f) = File::open(p) {
                         print!("Project: ");
@@ -355,7 +371,7 @@ impl Pinky {
                     }
                 }
                 if self.include_plan {
-                    let mut p = PathBuf::from(&pw.user_dir);
+                    let mut p = PathBuf::from(&user_dir);
                     p.push(".plan");
                     if let Ok(f) = File::open(p) {
                         println!("Plan:");

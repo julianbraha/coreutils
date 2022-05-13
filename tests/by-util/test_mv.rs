@@ -595,9 +595,9 @@ fn test_mv_update_option() {
 
     at.touch(file_a);
     at.touch(file_b);
-    let ts = time::now().to_timespec();
-    let now = FileTime::from_unix_time(ts.sec as i64, ts.nsec as u32);
-    let later = FileTime::from_unix_time(ts.sec as i64 + 3600, ts.nsec as u32);
+    let ts = time::OffsetDateTime::now_local().unwrap();
+    let now = FileTime::from_unix_time(ts.unix_timestamp(), ts.nanosecond());
+    let later = FileTime::from_unix_time(ts.unix_timestamp() as i64 + 3600, ts.nanosecond() as u32);
     filetime::set_file_times(at.plus_as_string(file_a), now, now).unwrap();
     filetime::set_file_times(at.plus_as_string(file_b), now, later).unwrap();
 
@@ -783,7 +783,7 @@ fn test_mv_verbose() {
 }
 
 #[test]
-#[cfg(target_os = "linux")] // mkdir does not support -m on windows. Freebsd doesn't return a permission error either.
+#[cfg(any(target_os = "linux", target_os = "android"))] // mkdir does not support -m on windows. Freebsd doesn't return a permission error either.
 fn test_mv_permission_error() {
     let scene = TestScenario::new("mkdir");
     let folder1 = "bar";
