@@ -13,12 +13,15 @@
 extern crate uucore;
 
 use clap::{crate_version, Arg, ArgMatches, Command};
+use std::error::Error;
+use std::fmt;
 use std::fs::File;
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Read, Write};
+use std::num::IntErrorKind;
 use std::str::from_utf8;
 use unicode_width::UnicodeWidthChar;
 use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult};
+use uucore::error::{FromIo, UError, UResult};
 use uucore::format_usage;
 
 static ABOUT: &str = "Convert tabs in each FILE to spaces, writing to standard output.
@@ -38,6 +41,7 @@ static DEFAULT_TABSTOP: usize = 8;
 
 /// The mode to use when replacing tabs beyond the last one specified in
 /// the `--tabs` argument.
+#[derive(PartialEq)]
 enum RemainingMode {
     None,
     Slash,
@@ -57,6 +61,44 @@ fn is_space_or_comma(c: char) -> bool {
     c == ' ' || c == ','
 }
 
+/// Errors that can occur when parsing a `--tabs` argument.
+#[derive(Debug)]
+enum ParseError {
+    InvalidCharacter(String),
+    SpecifierNotAtStartOfNumber(String, String),
+    SpecifierOnlyAllowedWithLastValue(String),
+    TabSizeCannotBeZero,
+    TabSizeTooLarge(String),
+    TabSizesMustBeAscending,
+}
+
+impl Error for ParseError {}
+impl UError for ParseError {}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::InvalidCharacter(s) => {
+                write!(f, "tab size contains invalid character(s): {}", s.quote())
+            }
+            Self::SpecifierNotAtStartOfNumber(specifier, s) => write!(
+                f,
+                "{} specifier not at start of number: {}",
+                specifier.quote(),
+                s.quote(),
+            ),
+            Self::SpecifierOnlyAllowedWithLastValue(specifier) => write!(
+                f,
+                "{} specifier only allowed with the last value",
+                specifier.quote()
+            ),
+            Self::TabSizeCannotBeZero => write!(f, "tab size cannot be 0"),
+            Self::TabSizeTooLarge(s) => write!(f, "tab stop is too large {}", s.quote()),
+            Self::TabSizesMustBeAscending => write!(f, "tab sizes must be ascending"),
+        }
+    }
+}
+
 /// Parse a list of tabstops from a `--tabs` argument.
 ///
 /// This function returns both the vector of numbers appearing in the
@@ -65,18 +107,19 @@ fn is_space_or_comma(c: char) -> bool {
 /// in the list. This mode defines the strategy to use for computing the
 /// number of spaces to use for columns beyond the end of the tab stop
 /// list specified here.
-fn tabstops_parse(s: &str) -> (RemainingMode, Vec<usize>) {
+fn tabstops_parse(s: &str) -> Result<(RemainingMode, Vec<usize>), ParseError> {
     // Leading commas and spaces are ignored.
     let s = s.trim_start_matches(is_space_or_comma);
 
     // If there were only commas and spaces in the string, just use the
     // default tabstops.
     if s.is_empty() {
-        return (RemainingMode::None, vec![DEFAULT_TABSTOP]);
+        return Ok((RemainingMode::None, vec![DEFAULT_TABSTOP]));
     }
 
     let mut nums = vec![];
     let mut remaining_mode = RemainingMode::None;
+    let mut is_specifier_already_used = false;
     for word in s.split(is_space_or_comma) {
         let bytes = word.as_bytes();
         for i in 0..bytes.len() {
@@ -89,23 +132,54 @@ fn tabstops_parse(s: &str) -> (RemainingMode, Vec<usize>) {
                 }
                 _ => {
                     // Parse a number from the byte sequence.
-                    let num = from_utf8(&bytes[i..]).unwrap().parse::<usize>().unwrap();
+                    let s = from_utf8(&bytes[i..]).unwrap();
+                    match s.parse::<usize>() {
+                        Ok(num) => {
+                            // Tab size must be positive.
+                            if num == 0 {
+                                return Err(ParseError::TabSizeCannotBeZero);
+                            }
 
-                    // Tab size must be positive.
-                    if num == 0 {
-                        crash!(1, "{}\n", "tab size cannot be 0");
-                    }
+                            // Tab sizes must be ascending.
+                            if let Some(last_stop) = nums.last() {
+                                if *last_stop >= num {
+                                    return Err(ParseError::TabSizesMustBeAscending);
+                                }
+                            }
 
-                    // Tab sizes must be ascending.
-                    if let Some(last_stop) = nums.last() {
-                        if *last_stop >= num {
-                            crash!(1, "tab sizes must be ascending");
+                            if is_specifier_already_used {
+                                let specifier = if remaining_mode == RemainingMode::Slash {
+                                    "/".to_string()
+                                } else {
+                                    "+".to_string()
+                                };
+                                return Err(ParseError::SpecifierOnlyAllowedWithLastValue(
+                                    specifier,
+                                ));
+                            } else if remaining_mode != RemainingMode::None {
+                                is_specifier_already_used = true;
+                            }
+
+                            // Append this tab stop to the list of all tabstops.
+                            nums.push(num);
+                            break;
+                        }
+                        Err(e) => {
+                            if *e.kind() == IntErrorKind::PosOverflow {
+                                return Err(ParseError::TabSizeTooLarge(s.to_string()));
+                            }
+
+                            let s = s.trim_start_matches(char::is_numeric);
+                            if s.starts_with('/') || s.starts_with('+') {
+                                return Err(ParseError::SpecifierNotAtStartOfNumber(
+                                    s[0..1].to_string(),
+                                    s.to_string(),
+                                ));
+                            } else {
+                                return Err(ParseError::InvalidCharacter(s.to_string()));
+                            }
                         }
                     }
-
-                    // Append this tab stop to the list of all tabstops.
-                    nums.push(num);
-                    break;
                 }
             }
         }
@@ -115,7 +189,7 @@ fn tabstops_parse(s: &str) -> (RemainingMode, Vec<usize>) {
     if nums.is_empty() {
         nums = vec![DEFAULT_TABSTOP];
     }
-    (remaining_mode, nums)
+    Ok((remaining_mode, nums))
 }
 
 struct Options {
@@ -131,9 +205,9 @@ struct Options {
 }
 
 impl Options {
-    fn new(matches: &ArgMatches) -> Self {
-        let (remaining_mode, tabstops) = match matches.value_of(options::TABS) {
-            Some(s) => tabstops_parse(s),
+    fn new(matches: &ArgMatches) -> Result<Self, ParseError> {
+        let (remaining_mode, tabstops) = match matches.values_of(options::TABS) {
+            Some(s) => tabstops_parse(&s.collect::<Vec<&str>>().join(","))?,
             None => (RemainingMode::None, vec![DEFAULT_TABSTOP]),
         };
 
@@ -158,14 +232,14 @@ impl Options {
             None => vec!["-".to_owned()],
         };
 
-        Self {
+        Ok(Self {
             files,
             tabstops,
             tspaces,
             iflag,
             uflag,
             remaining_mode,
-        }
+        })
     }
 }
 
@@ -173,7 +247,7 @@ impl Options {
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let matches = uu_app().get_matches_from(args);
 
-    expand(&Options::new(&matches)).map_err_context(|| "failed to write output".to_string())
+    expand(&Options::new(&matches)?).map_err_context(|| "failed to write output".to_string())
 }
 
 pub fn uu_app<'a>() -> Command<'a> {
@@ -195,6 +269,7 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .short('t')
                 .value_name("N, LIST")
                 .takes_value(true)
+                .multiple_occurrences(true)
                 .help("have tabs N characters apart, not 8 or use comma separated list of explicit tab positions"),
         )
         .arg(
@@ -207,6 +282,7 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .multiple_occurrences(true)
                 .hide(true)
                 .takes_value(true)
+                .value_hint(clap::ValueHint::FilePath)
         )
 }
 

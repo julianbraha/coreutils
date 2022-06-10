@@ -142,6 +142,7 @@ sed -i 's|touch |/usr/bin/touch |' tests/cp/preserve-link.sh tests/cp/reflink-pe
 sed -i 's|ln -|/usr/bin/ln -|' tests/cp/link-deref.sh
 sed -i 's|cp |/usr/bin/cp |' tests/mv/hard-2.sh
 sed -i 's|paste |/usr/bin/paste |' tests/misc/od-endian.sh
+sed -i 's|timeout |/usr/bin/timeout |' tests/tail-2/follow-stdin.sh
 
 # Add specific timeout to tests that currently hang to limit time spent waiting
 sed -i 's|\(^\s*\)seq \$|\1/usr/bin/timeout 0.1 seq \$|' tests/misc/seq-precision.sh tests/misc/seq-long-double.sh
@@ -198,3 +199,4 @@ sed -i -e "s/provoked error./provoked error\ncat pat |sort -u > pat/" tests/misc
 
 # Update the GNU error message to match ours
 sed -i -e "s/ln: 'f' and 'f' are the same file/ln: failed to link 'f' to 'f': Same file/g" tests/ln/hard-backup.sh
+sed -i -e "s/failed to access 'no-such-dir'\":/failed to link 'no-such-dir'\"/" -e "s/link-to-dir: hard link not allowed for directory/failed to link 'link-to-dir' to/" -e "s|link-to-dir/: hard link not allowed for directory|failed to link 'link-to-dir/' to|" tests/ln/hard-to-sym.sh

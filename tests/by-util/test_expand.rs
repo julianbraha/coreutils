@@ -1,4 +1,5 @@
 use crate::common::util::*;
+use uucore::display::Quotable;
 // spell-checker:ignore (ToDO) taaaa tbbbb tcccc
 
 #[test]
@@ -68,6 +69,15 @@ fn test_tabs_space_separated_list() {
 fn test_tabs_mixed_style_list() {
     new_ucmd!()
         .args(&["--tabs", ", 3,6 9"])
+        .pipe_in("a\tb\tc\td\te")
+        .succeeds()
+        .stdout_is("a  b  c  d e");
+}
+
+#[test]
+fn test_multiple_tabs_args() {
+    new_ucmd!()
+        .args(&["--tabs=3", "--tabs=6", "--tabs=9"])
         .pipe_in("a\tb\tc\td\te")
         .succeeds()
         .stdout_is("a  b  c  d e");
@@ -171,6 +181,14 @@ fn test_tabs_must_be_ascending() {
 }
 
 #[test]
+fn test_tabs_cannot_be_zero() {
+    new_ucmd!()
+        .arg("--tabs=0")
+        .fails()
+        .stderr_contains("tab size cannot be 0");
+}
+
+#[test]
 fn test_tabs_keep_last_trailing_specifier() {
     // If there are multiple trailing specifiers, use only the last one
     // before the number.
@@ -190,4 +208,58 @@ fn test_tabs_comma_separated_no_numbers() {
         .pipe_in("\ta\tb\tc")
         .succeeds()
         .stdout_is("        a       b       c");
+}
+
+#[test]
+fn test_tabs_with_specifier_not_at_start() {
+    fn run_cmd(arg: &str, expected_prefix: &str, expected_suffix: &str) {
+        let expected_msg = format!(
+            "{} specifier not at start of number: {}",
+            expected_prefix.quote(),
+            expected_suffix.quote()
+        );
+        new_ucmd!().arg(arg).fails().stderr_contains(expected_msg);
+    }
+    run_cmd("--tabs=1/", "/", "/");
+    run_cmd("--tabs=1/2", "/", "/2");
+    run_cmd("--tabs=1+", "+", "+");
+    run_cmd("--tabs=1+2", "+", "+2");
+}
+
+#[test]
+fn test_tabs_with_specifier_only_allowed_with_last_value() {
+    fn run_cmd(arg: &str, specifier: &str) {
+        let expected_msg = format!(
+            "{} specifier only allowed with the last value",
+            specifier.quote()
+        );
+        new_ucmd!().arg(arg).fails().stderr_contains(expected_msg);
+    }
+    run_cmd("--tabs=/1,2,3", "/");
+    run_cmd("--tabs=1,/2,3", "/");
+    new_ucmd!().arg("--tabs=1,2,/3").succeeds();
+
+    run_cmd("--tabs=+1,2,3", "+");
+    run_cmd("--tabs=1,+2,3", "+");
+    new_ucmd!().arg("--tabs=1,2,+3").succeeds();
+}
+
+#[test]
+fn test_tabs_with_invalid_chars() {
+    new_ucmd!()
+        .arg("--tabs=x")
+        .fails()
+        .stderr_contains("tab size contains invalid character(s): 'x'");
+    new_ucmd!()
+        .arg("--tabs=1x2")
+        .fails()
+        .stderr_contains("tab size contains invalid character(s): 'x2'");
+}
+
+#[test]
+fn test_tabs_with_too_large_size() {
+    let arg = format!("--tabs={}", u128::MAX);
+    let expected_error = format!("tab stop is too large '{}'", u128::MAX);
+
+    new_ucmd!().arg(arg).fails().stderr_contains(expected_error);
 }

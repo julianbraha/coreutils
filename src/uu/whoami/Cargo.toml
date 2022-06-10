@@ -1,6 +1,6 @@
 [package]
 name = "uu_whoami"
-version = "0.0.13"
+version = "0.0.14"
 authors = ["uutils developers"]
 license = "MIT"
 description = "whoami ~ (uutils) display user name of current effective user ID"
@@ -22,7 +22,7 @@ uucore = { version=">=0.0.11", package="uucore", path="../../uucore", features=[
 winapi = { version = "0.3", features = ["lmcons"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.125"
+libc = "0.2.126"
 
 [[bin]]
 name = "whoami"

@@ -21,7 +21,7 @@ mod options {
 
 fn get_long_usage() -> String {
     String::from(
-        "Output each NAME with its last non-slash component and trailing slashes
+        "Output each NAME with its last non-slash component and trailing slashes \n\
         removed; if NAME contains no /'s, output '.' (meaning the current directory).",
     )
 }
@@ -88,5 +88,10 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .short('z')
                 .help("separate output with NUL rather than newline"),
         )
-        .arg(Arg::new(options::DIR).hide(true).multiple_occurrences(true))
+        .arg(
+            Arg::new(options::DIR)
+                .hide(true)
+                .multiple_occurrences(true)
+                .value_hint(clap::ValueHint::AnyPath),
+        )
 }

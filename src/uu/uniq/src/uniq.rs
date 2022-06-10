@@ -5,6 +5,9 @@
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
 
+// TODO remove this when https://github.com/rust-lang/rust-clippy/issues/6902 is fixed
+#![allow(clippy::use_self)]
+
 use clap::{crate_version, Arg, ArgMatches, Command};
 use std::fs::File;
 use std::io::{self, stdin, stdout, BufRead, BufReader, BufWriter, Read, Write};
@@ -392,7 +395,8 @@ pub fn uu_app<'a>() -> Command<'a> {
             Arg::new(ARG_FILES)
                 .multiple_occurrences(true)
                 .takes_value(true)
-                .max_values(2),
+                .max_values(2)
+                .value_hint(clap::ValueHint::FilePath),
         )
 }
 

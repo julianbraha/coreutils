@@ -7,10 +7,9 @@
 //!
 //! A table ([`Table`]) comprises a header row ([`Header`]) and a
 //! collection of data rows ([`Row`]), one per filesystem.
-use number_prefix::NumberPrefix;
 use unicode_width::UnicodeWidthStr;
 
-use crate::blocks::{HumanReadable, SizeFormat};
+use crate::blocks::{to_magnitude_and_suffix, SuffixType};
 use crate::columns::{Alignment, Column};
 use crate::filesystem::Filesystem;
 use crate::{BlockSize, Options};
@@ -205,23 +204,17 @@ pub(crate) struct RowFormatter<'a> {
     // numbers. We could split the options up into those groups to
     // reduce the coupling between this `table.rs` module and the main
     // `df.rs` module.
+    /// Whether to use the special rules for displaying the total row.
+    is_total_row: bool,
 }
 
 impl<'a> RowFormatter<'a> {
     /// Instantiate this struct.
-    pub(crate) fn new(row: &'a Row, options: &'a Options) -> Self {
-        Self { row, options }
-    }
-
-    /// Get a human readable string giving the scaled version of the input number.
-    fn scaled_human_readable(&self, size: u64, human_readable: HumanReadable) -> String {
-        let number_prefix = match human_readable {
-            HumanReadable::Decimal => NumberPrefix::decimal(size as f64),
-            HumanReadable::Binary => NumberPrefix::binary(size as f64),
-        };
-        match number_prefix {
-            NumberPrefix::Standalone(bytes) => bytes.to_string(),
-            NumberPrefix::Prefixed(prefix, bytes) => format!("{:.1}{}", bytes, prefix.symbol()),
+    pub(crate) fn new(row: &'a Row, options: &'a Options, is_total_row: bool) -> Self {
+        Self {
+            row,
+            options,
+            is_total_row,
         }
     }
 
@@ -229,12 +222,11 @@ impl<'a> RowFormatter<'a> {
     ///
     /// The scaling factor is defined in the `options` field.
     fn scaled_bytes(&self, size: u64) -> String {
-        match self.options.size_format {
-            SizeFormat::HumanReadable(h) => self.scaled_human_readable(size, h),
-            SizeFormat::StaticBlockSize => {
-                let BlockSize::Bytes(d) = self.options.block_size;
-                (size / d).to_string()
-            }
+        if let Some(h) = self.options.human_readable {
+            to_magnitude_and_suffix(size.into(), SuffixType::HumanReadable(h))
+        } else {
+            let BlockSize::Bytes(d) = self.options.block_size;
+            (size as f64 / d as f64).ceil().to_string()
         }
     }
 
@@ -242,9 +234,10 @@ impl<'a> RowFormatter<'a> {
     ///
     /// The scaling factor is defined in the `options` field.
     fn scaled_inodes(&self, size: u64) -> String {
-        match self.options.size_format {
-            SizeFormat::HumanReadable(h) => self.scaled_human_readable(size, h),
-            SizeFormat::StaticBlockSize => size.to_string(),
+        if let Some(h) = self.options.human_readable {
+            to_magnitude_and_suffix(size.into(), SuffixType::HumanReadable(h))
+        } else {
+            size.to_string()
         }
     }
 
@@ -264,13 +257,25 @@ impl<'a> RowFormatter<'a> {
 
         for column in &self.options.columns {
             let string = match column {
-                Column::Source => self.row.fs_device.to_string(),
+                Column::Source => {
+                    if self.is_total_row {
+                        "total".to_string()
+                    } else {
+                        self.row.fs_device.to_string()
+                    }
+                }
                 Column::Size => self.scaled_bytes(self.row.bytes),
                 Column::Used => self.scaled_bytes(self.row.bytes_used),
                 Column::Avail => self.scaled_bytes(self.row.bytes_avail),
                 Column::Pcent => Self::percentage(self.row.bytes_usage),
 
-                Column::Target => self.row.fs_mount.to_string(),
+                Column::Target => {
+                    if self.is_total_row && !self.options.columns.contains(&Column::Source) {
+                        "total".to_string()
+                    } else {
+                        self.row.fs_mount.to_string()
+                    }
+                }
                 Column::Itotal => self.scaled_inodes(self.row.inodes),
                 Column::Iused => self.scaled_inodes(self.row.inodes_used),
                 Column::Iavail => self.scaled_inodes(self.row.inodes_free),
@@ -384,7 +389,7 @@ impl Table {
             // the output table.
             if options.show_all_fs || filesystem.usage.blocks > 0 {
                 let row = Row::from(filesystem);
-                let fmt = RowFormatter::new(&row, options);
+                let fmt = RowFormatter::new(&row, options, false);
                 let values = fmt.get_values();
                 total += row;
 
@@ -399,7 +404,7 @@ impl Table {
         }
 
         if options.show_total {
-            let total_row = RowFormatter::new(&total, options);
+            let total_row = RowFormatter::new(&total, options, true);
             rows.push(total_row.get_values());
         }
 
@@ -450,7 +455,7 @@ impl fmt::Display for Table {
 #[cfg(test)]
 mod tests {
 
-    use crate::blocks::{HumanReadable, SizeFormat};
+    use crate::blocks::HumanReadable;
     use crate::columns::Column;
     use crate::table::{Header, HeaderMode, Row, RowFormatter};
     use crate::{BlockSize, Options};
@@ -638,7 +643,7 @@ mod tests {
 
             ..Default::default()
         };
-        let fmt = RowFormatter::new(&row, &options);
+        let fmt = RowFormatter::new(&row, &options, false);
         assert_eq!(
             fmt.get_values(),
             vec!("my_device", "100", "25", "75", "25%", "my_mount")
@@ -664,7 +669,7 @@ mod tests {
 
             ..Default::default()
         };
-        let fmt = RowFormatter::new(&row, &options);
+        let fmt = RowFormatter::new(&row, &options, false);
         assert_eq!(
             fmt.get_values(),
             vec!("my_device", "my_type", "100", "25", "75", "25%", "my_mount")
@@ -689,7 +694,7 @@ mod tests {
 
             ..Default::default()
         };
-        let fmt = RowFormatter::new(&row, &options);
+        let fmt = RowFormatter::new(&row, &options, false);
         assert_eq!(
             fmt.get_values(),
             vec!("my_device", "10", "2", "8", "20%", "my_mount")
@@ -708,14 +713,14 @@ mod tests {
             inodes: 10,
             ..Default::default()
         };
-        let fmt = RowFormatter::new(&row, &options);
+        let fmt = RowFormatter::new(&row, &options, false);
         assert_eq!(fmt.get_values(), vec!("1", "10"));
     }
 
     #[test]
     fn test_row_formatter_with_human_readable_si() {
         let options = Options {
-            size_format: SizeFormat::HumanReadable(HumanReadable::Decimal),
+            human_readable: Some(HumanReadable::Decimal),
             columns: COLUMNS_WITH_FS_TYPE.to_vec(),
             ..Default::default()
         };
@@ -731,25 +736,17 @@ mod tests {
 
             ..Default::default()
         };
-        let fmt = RowFormatter::new(&row, &options);
+        let fmt = RowFormatter::new(&row, &options, false);
         assert_eq!(
             fmt.get_values(),
-            vec!(
-                "my_device",
-                "my_type",
-                "4.0k",
-                "1.0k",
-                "3.0k",
-                "25%",
-                "my_mount"
-            )
+            vec!("my_device", "my_type", "4k", "1k", "3k", "25%", "my_mount")
         );
     }
 
     #[test]
     fn test_row_formatter_with_human_readable_binary() {
         let options = Options {
-            size_format: SizeFormat::HumanReadable(HumanReadable::Binary),
+            human_readable: Some(HumanReadable::Binary),
             columns: COLUMNS_WITH_FS_TYPE.to_vec(),
             ..Default::default()
         };
@@ -765,18 +762,10 @@ mod tests {
 
             ..Default::default()
         };
-        let fmt = RowFormatter::new(&row, &options);
+        let fmt = RowFormatter::new(&row, &options, false);
         assert_eq!(
             fmt.get_values(),
-            vec!(
-                "my_device",
-                "my_type",
-                "4.0Ki",
-                "1.0Ki",
-                "3.0Ki",
-                "25%",
-                "my_mount"
-            )
+            vec!("my_device", "my_type", "4K", "1K", "3K", "25%", "my_mount")
         );
     }
 
@@ -790,7 +779,31 @@ mod tests {
             bytes_usage: Some(0.251),
             ..Default::default()
         };
-        let fmt = RowFormatter::new(&row, &options);
+        let fmt = RowFormatter::new(&row, &options, false);
         assert_eq!(fmt.get_values(), vec!("26%"));
+    }
+
+    #[test]
+    fn test_row_formatter_with_round_up_byte_values() {
+        fn get_formatted_values(bytes: u64, bytes_used: u64, bytes_avail: u64) -> Vec<String> {
+            let options = Options {
+                block_size: BlockSize::Bytes(1000),
+                columns: vec![Column::Size, Column::Used, Column::Avail],
+                ..Default::default()
+            };
+
+            let row = Row {
+                bytes,
+                bytes_used,
+                bytes_avail,
+                ..Default::default()
+            };
+            RowFormatter::new(&row, &options, false).get_values()
+        }
+
+        assert_eq!(get_formatted_values(100, 100, 0), vec!("1", "1", "0"));
+        assert_eq!(get_formatted_values(100, 99, 1), vec!("1", "1", "1"));
+        assert_eq!(get_formatted_values(1000, 1000, 0), vec!("1", "1", "0"));
+        assert_eq!(get_formatted_values(1001, 1000, 1), vec!("2", "1", "1"));
     }
 }

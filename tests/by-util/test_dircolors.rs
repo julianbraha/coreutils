@@ -1,3 +1,4 @@
+// spell-checker:ignore overridable
 use crate::common::util::*;
 
 extern crate dircolors;
@@ -62,6 +63,14 @@ fn test_internal_db() {
 }
 
 #[test]
+fn test_ls_colors() {
+    new_ucmd!()
+        .arg("--print-ls-colors")
+        .run()
+        .stdout_is_fixture("ls_colors.expected");
+}
+
+#[test]
 fn test_bash_default() {
     new_ucmd!()
         .env("TERM", "screen")
@@ -78,6 +87,19 @@ fn test_csh_default() {
         .run()
         .stdout_is_fixture("csh_def.expected");
 }
+#[test]
+fn test_overridable_args() {
+    new_ucmd!()
+        .env("TERM", "screen")
+        .arg("-bc")
+        .run()
+        .stdout_is_fixture("csh_def.expected");
+    new_ucmd!()
+        .env("TERM", "screen")
+        .arg("-cb")
+        .run()
+        .stdout_is_fixture("bash_def.expected");
+}
 
 #[test]
 fn test_no_env() {
@@ -87,7 +109,45 @@ fn test_no_env() {
 
 #[test]
 fn test_exclusive_option() {
-    new_ucmd!().arg("-cp").fails();
+    new_ucmd!()
+        .arg("-bp")
+        .fails()
+        .stderr_contains("mutually exclusive");
+    new_ucmd!()
+        .arg("-cp")
+        .fails()
+        .stderr_contains("mutually exclusive");
+    new_ucmd!()
+        .args(&["-b", "--print-ls-colors"])
+        .fails()
+        .stderr_contains("mutually exclusive");
+    new_ucmd!()
+        .args(&["-c", "--print-ls-colors"])
+        .fails()
+        .stderr_contains("mutually exclusive");
+    new_ucmd!()
+        .args(&["-p", "--print-ls-colors"])
+        .fails()
+        .stderr_contains("mutually exclusive");
+}
+
+#[test]
+fn test_stdin() {
+    new_ucmd!()
+        .pipe_in("owt 40;33\n")
+        .args(&["-b", "-"])
+        .succeeds()
+        .stdout_is("LS_COLORS='tw=40;33:';\nexport LS_COLORS\n")
+        .no_stderr();
+}
+
+#[test]
+fn test_extra_operand() {
+    new_ucmd!()
+        .args(&["-c", "file1", "file2"])
+        .fails()
+        .stderr_contains("dircolors: extra operand 'file2'\n")
+        .no_stdout();
 }
 
 fn test_helper(file_name: &str, term: &str) {

@@ -11,7 +11,7 @@ mod columns;
 mod filesystem;
 mod table;
 
-use blocks::{HumanReadable, SizeFormat};
+use blocks::HumanReadable;
 use table::HeaderMode;
 use uucore::display::Quotable;
 use uucore::error::{UError, UResult, USimpleError};
@@ -25,7 +25,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use crate::blocks::{block_size_from_matches, BlockSize};
+use crate::blocks::{read_block_size, BlockSize};
 use crate::columns::{Column, ColumnError};
 use crate::filesystem::Filesystem;
 use crate::table::Table;
@@ -71,7 +71,7 @@ static OUTPUT_FIELD_LIST: [&str; 12] = [
 struct Options {
     show_local_fs: bool,
     show_all_fs: bool,
-    size_format: SizeFormat,
+    human_readable: Option<HumanReadable>,
     block_size: BlockSize,
     header_mode: HeaderMode,
 
@@ -87,6 +87,9 @@ struct Options {
     /// types will *not* be listed.
     exclude: Option<Vec<String>>,
 
+    /// Whether to sync before operating.
+    sync: bool,
+
     /// Whether to show a final row comprising the totals for each column.
     show_total: bool,
 
@@ -100,10 +103,11 @@ impl Default for Options {
             show_local_fs: Default::default(),
             show_all_fs: Default::default(),
             block_size: Default::default(),
-            size_format: Default::default(),
+            human_readable: Default::default(),
             header_mode: Default::default(),
             include: Default::default(),
             exclude: Default::default(),
+            sync: Default::default(),
             show_total: Default::default(),
             columns: vec![
                 Column::Source,
@@ -121,6 +125,7 @@ impl Default for Options {
 enum OptionsError {
     BlockSizeTooLarge(String),
     InvalidBlockSize(String),
+    InvalidSuffix(String),
 
     /// An error getting the columns to display in the output table.
     ColumnError(ColumnError),
@@ -139,11 +144,15 @@ impl fmt::Display for OptionsError {
             // TODO This needs to vary based on whether `--block-size`
             // or `-B` were provided.
             Self::InvalidBlockSize(s) => write!(f, "invalid --block-size argument {}", s),
+            // TODO This needs to vary based on whether `--block-size`
+            // or `-B` were provided.
+            Self::InvalidSuffix(s) => write!(f, "invalid suffix in --block-size argument {}", s),
             Self::ColumnError(ColumnError::MultipleColumns(s)) => write!(
                 f,
                 "option --output: field {} used more than once",
                 s.quote()
             ),
+            #[allow(clippy::print_in_format_impl)]
             Self::FilesystemTypeBothSelectedAndExcluded(types) => {
                 for t in types {
                     eprintln!(
@@ -173,7 +182,9 @@ impl Options {
         Ok(Self {
             show_local_fs: matches.is_present(OPT_LOCAL),
             show_all_fs: matches.is_present(OPT_ALL),
-            block_size: block_size_from_matches(matches).map_err(|e| match e {
+            sync: matches.is_present(OPT_SYNC),
+            block_size: read_block_size(matches).map_err(|e| match e {
+                ParseSizeError::InvalidSuffix(s) => OptionsError::InvalidSuffix(s),
                 ParseSizeError::SizeTooBig(_) => OptionsError::BlockSizeTooLarge(
                     matches.value_of(OPT_BLOCKSIZE).unwrap().to_string(),
                 ),
@@ -194,13 +205,13 @@ impl Options {
                     HeaderMode::Default
                 }
             },
-            size_format: {
+            human_readable: {
                 if matches.is_present(OPT_HUMAN_READABLE_BINARY) {
-                    SizeFormat::HumanReadable(HumanReadable::Binary)
+                    Some(HumanReadable::Binary)
                 } else if matches.is_present(OPT_HUMAN_READABLE_DECIMAL) {
-                    SizeFormat::HumanReadable(HumanReadable::Decimal)
+                    Some(HumanReadable::Decimal)
                 } else {
-                    SizeFormat::StaticBlockSize
+                    None
                 }
             },
             include,
@@ -319,9 +330,21 @@ fn filter_mount_list(vmi: Vec<MountInfo>, opt: &Options) -> Vec<MountInfo> {
 
 /// Get all currently mounted filesystems.
 ///
-/// `opt` excludes certain filesystems from consideration; see
+/// `opt` excludes certain filesystems from consideration and allows for the synchronization of filesystems before running; see
 /// [`Options`] for more information.
+
 fn get_all_filesystems(opt: &Options) -> Vec<Filesystem> {
+    // Run a sync call before any operation if so instructed.
+    if opt.sync {
+        #[cfg(not(windows))]
+        unsafe {
+            #[cfg(not(target_os = "android"))]
+            uucore::libc::sync();
+            #[cfg(target_os = "android")]
+            uucore::libc::syscall(uucore::libc::SYS_sync);
+        }
+    }
+
     // The list of all mounted filesystems.
     //
     // Filesystems excluded by the command-line options are
@@ -553,7 +576,7 @@ pub fn uu_app<'a>() -> Command<'a> {
             Arg::new(OPT_SYNC)
                 .long("sync")
                 .overrides_with_all(&[OPT_NO_SYNC, OPT_SYNC])
-                .help("invoke sync before getting usage info"),
+                .help("invoke sync before getting usage info (non-windows only)"),
         )
         .arg(
             Arg::new(OPT_TYPE)
@@ -583,7 +606,11 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .multiple_occurrences(true)
                 .help("limit listing to file systems not of type TYPE"),
         )
-        .arg(Arg::new(OPT_PATHS).multiple_occurrences(true))
+        .arg(
+            Arg::new(OPT_PATHS)
+                .multiple_occurrences(true)
+                .value_hint(clap::ValueHint::AnyPath),
+        )
 }
 
 #[cfg(test)]

@@ -197,8 +197,8 @@ impl ScanUtil for str {
 
 pub fn group_num(s: &str) -> Cow<str> {
     let is_negative = s.starts_with('-');
-    assert!(is_negative || s.chars().take(1).all(|c| c.is_digit(10)));
-    assert!(s.chars().skip(1).all(|c| c.is_digit(10)));
+    assert!(is_negative || s.chars().take(1).all(|c| c.is_ascii_digit()));
+    assert!(s.chars().skip(1).all(|c| c.is_ascii_digit()));
     if s.len() < 4 {
         return s.into();
     }
@@ -1043,6 +1043,7 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .multiple_occurrences(true)
                 .takes_value(true)
                 .allow_invalid_utf8(true)
-                .min_values(1),
+                .min_values(1)
+                .value_hint(clap::ValueHint::FilePath),
         )
 }

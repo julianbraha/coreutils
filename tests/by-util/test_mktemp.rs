@@ -7,6 +7,9 @@ use uucore::display::Quotable;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 static TEST_TEMPLATE1: &str = "tempXXXXXX";
 static TEST_TEMPLATE2: &str = "temp";
 static TEST_TEMPLATE3: &str = "tempX";
@@ -23,6 +26,18 @@ static TEST_TEMPLATE8: &str = "tempXXXl\\ate";
 const TMPDIR: &str = "TMPDIR";
 #[cfg(windows)]
 const TMPDIR: &str = "TMP";
+
+/// An assertion that uses [`matches_template`] and adds a helpful error message.
+macro_rules! assert_matches_template {
+    ($template:expr, $s:expr) => {{
+        assert!(
+            matches_template($template, $s),
+            "\"{}\" != \"{}\"",
+            $template,
+            $s
+        );
+    }};
+}
 
 #[test]
 fn test_mktemp_mktemp() {
@@ -414,6 +429,37 @@ fn test_mktemp_directory_tmpdir() {
     assert!(PathBuf::from(result.stdout_str().trim()).is_dir());
 }
 
+/// Test for combining `--tmpdir` and a template with a subdirectory.
+#[test]
+fn test_tmpdir_template_has_subdirectory() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("a");
+    #[cfg(not(windows))]
+    let (template, joined) = ("a/bXXXX", "./a/bXXXX");
+    #[cfg(windows)]
+    let (template, joined) = (r"a\bXXXX", r".\a\bXXXX");
+    let result = ucmd.args(&["--tmpdir=.", template]).succeeds();
+    let filename = result.no_stderr().stdout_str().trim_end();
+    assert_matches_template!(joined, filename);
+    assert!(at.file_exists(filename));
+}
+
+/// Test that an absolute path is disallowed when --tmpdir is provided.
+#[test]
+fn test_tmpdir_absolute_path() {
+    #[cfg(windows)]
+    let path = r"C:\XXX";
+    #[cfg(not(windows))]
+    let path = "/XXX";
+    new_ucmd!()
+        .args(&["--tmpdir=a", path])
+        .fails()
+        .stderr_only(format!(
+            "mktemp: invalid template, '{}'; with --tmpdir, it may not be absolute\n",
+            path
+        ));
+}
+
 /// Decide whether a string matches a given template.
 ///
 /// In the template, the character `'X'` is treated as a wildcard,
@@ -447,18 +493,6 @@ fn matches_template(template: &str, s: &str) -> bool {
     true
 }
 
-/// An assertion that uses [`matches_template`] and adds a helpful error message.
-macro_rules! assert_matches_template {
-    ($template:expr, $s:expr) => {{
-        assert!(
-            matches_template($template, $s),
-            "\"{}\" != \"{}\"",
-            $template,
-            $s
-        );
-    }};
-}
-
 /// Test that the file is created in the directory given by the template.
 #[test]
 fn test_respect_template() {
@@ -485,9 +519,22 @@ fn test_respect_template_directory() {
     assert!(at.file_exists(filename));
 }
 
+#[cfg(unix)]
+#[test]
+fn test_directory_permissions() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let result = ucmd.args(&["-d", "XXX"]).succeeds();
+    let dirname = result.no_stderr().stdout_str().trim_end();
+    assert_matches_template!("XXX", dirname);
+    let metadata = at.metadata(dirname);
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.permissions().mode(), 0o40700);
+}
+
 /// Test that a template with a path separator is invalid.
 #[test]
 fn test_template_path_separator() {
+    #[cfg(not(windows))]
     new_ucmd!()
         .args(&["-t", "a/bXXX"])
         .fails()
@@ -495,4 +542,124 @@ fn test_template_path_separator() {
             "mktemp: invalid template, {}, contains directory separator\n",
             "a/bXXX".quote()
         ));
+    #[cfg(windows)]
+    new_ucmd!()
+        .args(&["-t", r"a\bXXX"])
+        .fails()
+        .stderr_only(format!(
+            "mktemp: invalid template, {}, contains directory separator\n",
+            r"a\bXXX".quote()
+        ));
+}
+
+/// Test that a suffix with a path separator is invalid.
+#[test]
+fn test_suffix_path_separator() {
+    #[cfg(not(windows))]
+    new_ucmd!()
+        .arg("aXXX/b")
+        .fails()
+        .stderr_only("mktemp: invalid suffix '/b', contains directory separator\n");
+    #[cfg(windows)]
+    new_ucmd!()
+        .arg(r"aXXX\b")
+        .fails()
+        .stderr_only("mktemp: invalid suffix '\\b', contains directory separator\n");
+    #[cfg(not(windows))]
+    new_ucmd!()
+        .arg("XXX/..")
+        .fails()
+        .stderr_only("mktemp: invalid suffix '/..', contains directory separator\n");
+    #[cfg(windows)]
+    new_ucmd!()
+        .arg(r"XXX\..")
+        .fails()
+        .stderr_only("mktemp: invalid suffix '\\..', contains directory separator\n");
+}
+
+#[test]
+fn test_too_few_xs_suffix() {
+    new_ucmd!()
+        .args(&["--suffix=X", "aXX"])
+        .fails()
+        .stderr_only("mktemp: too few X's in template 'aXXX'\n");
+}
+
+#[test]
+fn test_too_few_xs_suffix_directory() {
+    new_ucmd!()
+        .args(&["-d", "--suffix=X", "aXX"])
+        .fails()
+        .stderr_only("mktemp: too few X's in template 'aXXX'\n");
+}
+
+#[test]
+fn test_too_many_arguments() {
+    new_ucmd!().args(&["-q", "a", "b"]).fails().code_is(1);
+}
+
+#[test]
+fn test_two_contiguous_wildcard_blocks() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let template = "XXX_XXX";
+    let result = ucmd.arg(template).succeeds();
+    let filename = result.no_stderr().stdout_str().trim_end();
+    assert_eq!(&filename[..4], "XXX_");
+    assert_matches_template!(template, filename);
+    assert!(at.file_exists(filename));
+}
+
+#[test]
+fn test_three_contiguous_wildcard_blocks() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let template = "XXX_XXX_XXX";
+    let result = ucmd.arg(template).succeeds();
+    let filename = result.no_stderr().stdout_str().trim_end();
+    assert_eq!(&filename[..8], "XXX_XXX_");
+    assert_matches_template!(template, filename);
+    assert!(at.file_exists(filename));
+}
+
+/// Test that template must end in X even if `--suffix` is the empty string.
+#[test]
+fn test_suffix_must_end_in_x() {
+    new_ucmd!()
+        .args(&["--suffix=", "aXXXb"])
+        .fails()
+        .stderr_is("mktemp: with --suffix, template 'aXXXb' must end in X\n");
+}
+
+#[test]
+fn test_suffix_empty_template() {
+    new_ucmd!()
+        .args(&["--suffix=aXXXb", ""])
+        .fails()
+        .stderr_is("mktemp: with --suffix, template '' must end in X\n");
+
+    new_ucmd!()
+        .args(&["-d", "--suffix=aXXXb", ""])
+        .fails()
+        .stderr_is("mktemp: with --suffix, template '' must end in X\n");
+}
+
+#[test]
+fn test_mktemp_with_posixly_correct() {
+    let scene = TestScenario::new(util_name!());
+
+    scene
+        .ucmd()
+        .env("POSIXLY_CORRECT", "1")
+        .args(&["aXXXX", "--suffix=b"])
+        .fails()
+        .stderr_is(&format!(
+            "mktemp: too many templates\nTry '{} {} --help' for more information.\n",
+            scene.bin_path.to_string_lossy(),
+            scene.util_name
+        ));
+
+    scene
+        .ucmd()
+        .env("POSIXLY_CORRECT", "1")
+        .args(&["--suffix=b", "aXXXX"])
+        .succeeds();
 }

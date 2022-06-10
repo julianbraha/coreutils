@@ -29,6 +29,11 @@ fn test_df_compatible_si() {
 }
 
 #[test]
+fn test_df_compatible_sync() {
+    new_ucmd!().arg("--sync").succeeds();
+}
+
+#[test]
 fn test_df_arguments_override_themselves() {
     new_ucmd!().args(&["--help", "--help"]).succeeds();
     new_ucmd!().arg("-aa").succeeds();
@@ -360,6 +365,47 @@ fn test_total() {
     assert_eq!(computed_total_avail, reported_total_avail);
 }
 
+/// Test that the "total" label appears in the correct column.
+///
+/// The "total" label should appear in the "source" column, or in the
+/// "target" column if "source" is not visible.
+#[test]
+fn test_total_label_in_correct_column() {
+    let output = new_ucmd!()
+        .args(&["--output=source", "--total", "."])
+        .succeeds()
+        .stdout_move_str();
+    let last_line = output.lines().last().unwrap();
+    assert_eq!(last_line.trim(), "total");
+
+    let output = new_ucmd!()
+        .args(&["--output=target", "--total", "."])
+        .succeeds()
+        .stdout_move_str();
+    let last_line = output.lines().last().unwrap();
+    assert_eq!(last_line.trim(), "total");
+
+    let output = new_ucmd!()
+        .args(&["--output=source,target", "--total", "."])
+        .succeeds()
+        .stdout_move_str();
+    let last_line = output.lines().last().unwrap();
+    assert_eq!(
+        last_line.split_whitespace().collect::<Vec<&str>>(),
+        vec!["total", "-"]
+    );
+
+    let output = new_ucmd!()
+        .args(&["--output=target,source", "--total", "."])
+        .succeeds()
+        .stdout_move_str();
+    let last_line = output.lines().last().unwrap();
+    assert_eq!(
+        last_line.split_whitespace().collect::<Vec<&str>>(),
+        vec!["-", "total"]
+    );
+}
+
 #[test]
 fn test_use_percentage() {
     let output = new_ucmd!()
@@ -421,7 +467,7 @@ fn test_default_block_size() {
         .arg("--output=size")
         .succeeds()
         .stdout_move_str();
-    let header = output.lines().next().unwrap().to_string();
+    let header = output.lines().next().unwrap().trim().to_string();
 
     assert_eq!(header, "1K-blocks");
 
@@ -430,7 +476,7 @@ fn test_default_block_size() {
         .env("POSIXLY_CORRECT", "1")
         .succeeds()
         .stdout_move_str();
-    let header = output.lines().next().unwrap().to_string();
+    let header = output.lines().next().unwrap().trim().to_string();
 
     assert_eq!(header, "512B-blocks");
 }
@@ -445,6 +491,7 @@ fn test_default_block_size_in_posix_portability_mode() {
             .split_whitespace()
             .nth(1)
             .unwrap()
+            .trim()
             .to_string()
     }
 
@@ -466,7 +513,7 @@ fn test_block_size_1024() {
             .args(&["-B", &format!("{}", block_size), "--output=size"])
             .succeeds()
             .stdout_move_str();
-        output.lines().next().unwrap().to_string()
+        output.lines().next().unwrap().trim().to_string()
     }
 
     assert_eq!(get_header(1024), "1K-blocks");
@@ -490,7 +537,7 @@ fn test_block_size_with_suffix() {
             .args(&["-B", block_size, "--output=size"])
             .succeeds()
             .stdout_move_str();
-        output.lines().next().unwrap().to_string()
+        output.lines().next().unwrap().trim().to_string()
     }
 
     assert_eq!(get_header("K"), "1K-blocks");
@@ -522,6 +569,7 @@ fn test_block_size_in_posix_portability_mode() {
             .split_whitespace()
             .nth(1)
             .unwrap()
+            .trim()
             .to_string()
     }
 
@@ -530,6 +578,106 @@ fn test_block_size_in_posix_portability_mode() {
     assert_eq!(get_header("1KB"), "1000-blocks");
     assert_eq!(get_header("1M"), "1048576-blocks");
     assert_eq!(get_header("1MB"), "1000000-blocks");
+}
+
+#[test]
+fn test_block_size_from_env() {
+    fn get_header(env_var: &str, env_value: &str) -> String {
+        let output = new_ucmd!()
+            .arg("--output=size")
+            .env(env_var, env_value)
+            .succeeds()
+            .stdout_move_str();
+        output.lines().next().unwrap().trim().to_string()
+    }
+
+    assert_eq!(get_header("DF_BLOCK_SIZE", "111"), "111B-blocks");
+    assert_eq!(get_header("BLOCK_SIZE", "222"), "222B-blocks");
+    assert_eq!(get_header("BLOCKSIZE", "333"), "333B-blocks");
+}
+
+#[test]
+fn test_block_size_from_env_precedences() {
+    fn get_header(one: (&str, &str), two: (&str, &str)) -> String {
+        let (k1, v1) = one;
+        let (k2, v2) = two;
+        let output = new_ucmd!()
+            .arg("--output=size")
+            .env(k1, v1)
+            .env(k2, v2)
+            .succeeds()
+            .stdout_move_str();
+        output.lines().next().unwrap().trim().to_string()
+    }
+
+    let df_block_size = ("DF_BLOCK_SIZE", "111");
+    let block_size = ("BLOCK_SIZE", "222");
+    let blocksize = ("BLOCKSIZE", "333");
+
+    assert_eq!(get_header(df_block_size, block_size), "111B-blocks");
+    assert_eq!(get_header(df_block_size, blocksize), "111B-blocks");
+    assert_eq!(get_header(block_size, blocksize), "222B-blocks");
+}
+
+#[test]
+fn test_precedence_of_block_size_arg_over_env() {
+    let output = new_ucmd!()
+        .args(&["-B", "999", "--output=size"])
+        .env("DF_BLOCK_SIZE", "111")
+        .succeeds()
+        .stdout_move_str();
+    let header = output.lines().next().unwrap().trim().to_string();
+
+    assert_eq!(header, "999B-blocks");
+}
+
+#[test]
+fn test_invalid_block_size_from_env() {
+    let default_block_size_header = "1K-blocks";
+
+    let output = new_ucmd!()
+        .arg("--output=size")
+        .env("DF_BLOCK_SIZE", "invalid")
+        .succeeds()
+        .stdout_move_str();
+    let header = output.lines().next().unwrap().trim().to_string();
+
+    assert_eq!(header, default_block_size_header);
+
+    let output = new_ucmd!()
+        .arg("--output=size")
+        .env("DF_BLOCK_SIZE", "invalid")
+        .env("BLOCK_SIZE", "222")
+        .succeeds()
+        .stdout_move_str();
+    let header = output.lines().next().unwrap().trim().to_string();
+
+    assert_eq!(header, default_block_size_header);
+}
+
+#[test]
+fn test_ignore_block_size_from_env_in_posix_portability_mode() {
+    let default_block_size_header = "1024-blocks";
+
+    let output = new_ucmd!()
+        .arg("-P")
+        .env("DF_BLOCK_SIZE", "111")
+        .env("BLOCK_SIZE", "222")
+        .env("BLOCKSIZE", "333")
+        .succeeds()
+        .stdout_move_str();
+    let header = output
+        .lines()
+        .next()
+        .unwrap()
+        .to_string()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    assert_eq!(header, default_block_size_header);
 }
 
 #[test]
@@ -564,6 +712,19 @@ fn test_invalid_block_size() {
         .arg("--block-size=0K")
         .fails()
         .stderr_contains("invalid --block-size argument '0K'");
+}
+
+#[test]
+fn test_invalid_block_size_suffix() {
+    new_ucmd!()
+        .arg("--block-size=1H")
+        .fails()
+        .stderr_contains("invalid suffix in --block-size argument '1H'");
+
+    new_ucmd!()
+        .arg("--block-size=1.2")
+        .fails()
+        .stderr_contains("invalid suffix in --block-size argument '1.2'");
 }
 
 #[test]
