@@ -44,15 +44,26 @@ pub(crate) struct ProgUpdate {
 
     /// The time period over which the reads and writes were measured.
     pub(crate) duration: Duration,
+
+    /// The status of the write.
+    ///
+    /// True if the write is completed, false if still in-progress.
+    pub(crate) complete: bool,
 }
 
 impl ProgUpdate {
     /// Instantiate this struct.
-    pub(crate) fn new(read_stat: ReadStat, write_stat: WriteStat, duration: Duration) -> Self {
+    pub(crate) fn new(
+        read_stat: ReadStat,
+        write_stat: WriteStat,
+        duration: Duration,
+        complete: bool,
+    ) -> Self {
         Self {
             read_stat,
             write_stat,
             duration,
+            complete,
         }
     }
 
@@ -118,10 +129,7 @@ impl ProgUpdate {
     /// let mut cursor = Cursor::new(vec![]);
     /// let rewrite = false;
     /// prog_update.write_prog_line(&mut cursor, rewrite).unwrap();
-    /// assert_eq!(
-    ///     cursor.get_ref(),
-    ///     b"0 bytes (0 B, 0 B) copied, 1.0 s, 0 B/s\n"
-    /// );
+    /// assert_eq!(cursor.get_ref(), b"0 bytes copied, 1.0 s, 0 B/s\n");
     /// ```
     fn write_prog_line(&self, w: &mut impl Write, rewrite: bool) -> std::io::Result<()> {
         let btotal_metric = Byte::from_bytes(self.write_stat.bytes_total)
@@ -137,17 +145,38 @@ impl ProgUpdate {
 
         let btotal = self.write_stat.bytes_total;
         let duration = self.duration.as_secs_f64();
-        if rewrite {
+
+        // If we are rewriting the progress line, do write a carriage
+        // return (`\r`) at the beginning and don't write a newline
+        // (`\n`) at the end.
+        let (carriage_return, newline) = if rewrite { ("\r", "") } else { ("", "\n") };
+
+        // If the number of bytes written is sufficiently large, then
+        // print a more concise representation of the number, like
+        // "1.2 kB" and "1.0 KiB".
+        if btotal < 1000 {
             write!(
                 w,
-                "\r{} bytes ({}, {}) copied, {:.1} s, {}/s",
-                btotal, btotal_metric, btotal_bin, duration, transfer_rate
+                "{}{} bytes copied, {:.1} s, {}/s{}",
+                carriage_return, btotal, duration, transfer_rate, newline,
+            )
+        } else if btotal < 1024 {
+            write!(
+                w,
+                "{}{} bytes ({}) copied, {:.1} s, {}/s{}",
+                carriage_return, btotal, btotal_metric, duration, transfer_rate, newline,
             )
         } else {
-            writeln!(
+            write!(
                 w,
-                "{} bytes ({}, {}) copied, {:.1} s, {}/s",
-                btotal, btotal_metric, btotal_bin, duration, transfer_rate
+                "{}{} bytes ({}, {}) copied, {:.1} s, {}/s{}",
+                carriage_return,
+                btotal,
+                btotal_metric,
+                btotal_bin,
+                duration,
+                transfer_rate,
+                newline,
             )
         }
     }
@@ -157,7 +186,8 @@ impl ProgUpdate {
     /// This is a convenience method that calls
     /// [`ProgUpdate::write_io_lines`] and
     /// [`ProgUpdate::write_prog_line`] in that order. The information
-    /// is written to `w`.
+    /// is written to `w`. It optionally begins by writing a new line,
+    /// intended to handle the case of an existing progress line.
     ///
     /// # Examples
     ///
@@ -172,18 +202,18 @@ impl ProgUpdate {
     ///     duration: Duration::new(1, 0), // one second
     /// };
     /// let mut cursor = Cursor::new(vec![]);
-    /// prog_update.write_transfer_stats(&mut cursor).unwrap();
+    /// prog_update.write_transfer_stats(&mut cursor, false).unwrap();
     /// let mut iter = cursor.get_ref().split(|v| *v == b'\n');
     /// assert_eq!(iter.next().unwrap(), b"0+0 records in");
     /// assert_eq!(iter.next().unwrap(), b"0+0 records out");
-    /// assert_eq!(
-    ///     iter.next().unwrap(),
-    ///     b"0 bytes (0 B, 0 B) copied, 1.0 s, 0 B/s"
-    /// );
+    /// assert_eq!(iter.next().unwrap(), b"0 bytes copied, 1.0 s, 0 B/s");
     /// assert_eq!(iter.next().unwrap(), b"");
     /// assert!(iter.next().is_none());
     /// ```
-    fn write_transfer_stats(&self, w: &mut impl Write) -> std::io::Result<()> {
+    fn write_transfer_stats(&self, w: &mut impl Write, new_line: bool) -> std::io::Result<()> {
+        if new_line {
+            writeln!(w)?;
+        }
         self.write_io_lines(w)?;
         let rewrite = false;
         self.write_prog_line(w, rewrite)?;
@@ -210,9 +240,22 @@ impl ProgUpdate {
     /// Write all summary statistics.
     ///
     /// See [`ProgUpdate::write_transfer_stats`] for more information.
-    pub(crate) fn print_transfer_stats(&self) {
+    pub(crate) fn print_transfer_stats(&self, new_line: bool) {
         let mut stderr = std::io::stderr();
-        self.write_transfer_stats(&mut stderr).unwrap();
+        self.write_transfer_stats(&mut stderr, new_line).unwrap();
+    }
+
+    /// Write all the final statistics.
+    pub(crate) fn print_final_stats(
+        &self,
+        print_level: Option<StatusLevel>,
+        progress_printed: bool,
+    ) {
+        match print_level {
+            Some(StatusLevel::None) => {}
+            Some(StatusLevel::Noxfer) => self.print_io_lines(),
+            Some(StatusLevel::Progress) | None => self.print_transfer_stats(progress_printed),
+        }
     }
 }
 
@@ -365,9 +408,16 @@ pub(crate) fn gen_prog_updater(
     print_level: Option<StatusLevel>,
 ) -> impl Fn() {
     move || {
+        let mut progress_printed = false;
         while let Ok(update) = rx.recv() {
+            // Print the final read/write statistics.
+            if update.complete {
+                update.print_final_stats(print_level, progress_printed);
+                return;
+            }
             if Some(StatusLevel::Progress) == print_level {
                 update.reprint_prog_line();
+                progress_printed = true;
             }
         }
     }
@@ -412,19 +462,29 @@ pub(crate) fn gen_prog_updater(
             }
         });
 
-        let mut progress_as_secs = 0;
+        // Holds the state of whether we have printed the current progress.
+        // This is needed so that we know whether or not to print a newline
+        // character before outputting non-progress data.
+        let mut progress_printed = false;
         while let Ok(update) = rx.recv() {
-            // (Re)print status line if progress is requested.
-            if Some(StatusLevel::Progress) == print_level
-                && update.duration.as_secs() >= progress_as_secs
-            {
-                update.reprint_prog_line();
-                progress_as_secs = update.duration.as_secs() + 1;
+            // Print the final read/write statistics.
+            if update.complete {
+                update.print_final_stats(print_level, progress_printed);
+                return;
             }
-            // Handle signals
-            if let SIGUSR1_USIZE = sigval.load(Ordering::Relaxed) {
-                update.print_transfer_stats();
-            };
+            // (Re)print status line if progress is requested.
+            if Some(StatusLevel::Progress) == print_level && !update.complete {
+                update.reprint_prog_line();
+                progress_printed = true;
+            }
+            // Handle signals and set the signal to un-seen.
+            // This will print a maximum of 1 time per second, even though it
+            // should be printing on every SIGUSR1.
+            if let SIGUSR1_USIZE = sigval.swap(0, Ordering::Relaxed) {
+                update.print_transfer_stats(progress_printed);
+                // Reset the progress printed, since print_transfer_stats always prints a newline.
+                progress_printed = false;
+            }
         }
     }
 }
@@ -436,6 +496,18 @@ mod tests {
     use std::time::Duration;
 
     use super::{ProgUpdate, ReadStat, WriteStat};
+
+    fn prog_update_write(n: u128) -> ProgUpdate {
+        ProgUpdate {
+            read_stat: Default::default(),
+            write_stat: WriteStat {
+                bytes_total: n,
+                ..Default::default()
+            },
+            duration: Duration::new(1, 0), // one second
+            complete: false,
+        }
+    }
 
     #[test]
     fn test_read_stat_report() {
@@ -458,10 +530,12 @@ mod tests {
         let read_stat = ReadStat::new(1, 2, 3);
         let write_stat = WriteStat::new(4, 5, 6);
         let duration = Duration::new(789, 0);
+        let complete = false;
         let prog_update = ProgUpdate {
             read_stat,
             write_stat,
             duration,
+            complete,
         };
 
         let mut cursor = Cursor::new(vec![]);
@@ -478,6 +552,7 @@ mod tests {
             read_stat: Default::default(),
             write_stat: Default::default(),
             duration: Duration::new(1, 0), // one second
+            complete: false,
         };
 
         let mut cursor = Cursor::new(vec![]);
@@ -489,9 +564,38 @@ mod tests {
         //     $ : | dd
         //     0 bytes copied, 7.9151e-05 s, 0.0 kB/s
         //
+        // The throughput still does not match GNU dd. For the ones
+        // that include the concise byte counts, the format is also
+        // not right.
+        assert_eq!(cursor.get_ref(), b"0 bytes copied, 1.0 s, 0 B/s\n");
+
+        let prog_update = prog_update_write(999);
+        let mut cursor = Cursor::new(vec![]);
+        prog_update.write_prog_line(&mut cursor, rewrite).unwrap();
+        assert_eq!(cursor.get_ref(), b"999 bytes copied, 1.0 s, 0 B/s\n");
+
+        let prog_update = prog_update_write(1000);
+        let mut cursor = Cursor::new(vec![]);
+        prog_update.write_prog_line(&mut cursor, rewrite).unwrap();
         assert_eq!(
             cursor.get_ref(),
-            b"0 bytes (0 B, 0 B) copied, 1.0 s, 0 B/s\n"
+            b"1000 bytes (1000 B) copied, 1.0 s, 1000 B/s\n"
+        );
+
+        let prog_update = prog_update_write(1023);
+        let mut cursor = Cursor::new(vec![]);
+        prog_update.write_prog_line(&mut cursor, rewrite).unwrap();
+        assert_eq!(
+            cursor.get_ref(),
+            b"1023 bytes (1 KB) copied, 1.0 s, 1000 B/s\n"
+        );
+
+        let prog_update = prog_update_write(1024);
+        let mut cursor = Cursor::new(vec![]);
+        prog_update.write_prog_line(&mut cursor, rewrite).unwrap();
+        assert_eq!(
+            std::str::from_utf8(cursor.get_ref()).unwrap(),
+            "1024 bytes (1 KB, 1024 B) copied, 1.0 s, 1000 B/s\n"
         );
     }
 
@@ -501,16 +605,38 @@ mod tests {
             read_stat: Default::default(),
             write_stat: Default::default(),
             duration: Duration::new(1, 0), // one second
+            complete: false,
         };
         let mut cursor = Cursor::new(vec![]);
-        prog_update.write_transfer_stats(&mut cursor).unwrap();
+        prog_update
+            .write_transfer_stats(&mut cursor, false)
+            .unwrap();
         let mut iter = cursor.get_ref().split(|v| *v == b'\n');
         assert_eq!(iter.next().unwrap(), b"0+0 records in");
         assert_eq!(iter.next().unwrap(), b"0+0 records out");
-        assert_eq!(
-            iter.next().unwrap(),
-            b"0 bytes (0 B, 0 B) copied, 1.0 s, 0 B/s"
-        );
+        assert_eq!(iter.next().unwrap(), b"0 bytes copied, 1.0 s, 0 B/s");
+        assert_eq!(iter.next().unwrap(), b"");
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn write_final_transfer_stats() {
+        // Tests the formatting of the final statistics written after a progress line.
+        let prog_update = ProgUpdate {
+            read_stat: Default::default(),
+            write_stat: Default::default(),
+            duration: Duration::new(1, 0), // one second
+            complete: false,
+        };
+        let mut cursor = Cursor::new(vec![]);
+        let rewrite = true;
+        prog_update.write_prog_line(&mut cursor, rewrite).unwrap();
+        prog_update.write_transfer_stats(&mut cursor, true).unwrap();
+        let mut iter = cursor.get_ref().split(|v| *v == b'\n');
+        assert_eq!(iter.next().unwrap(), b"\r0 bytes copied, 1.0 s, 0 B/s");
+        assert_eq!(iter.next().unwrap(), b"0+0 records in");
+        assert_eq!(iter.next().unwrap(), b"0+0 records out");
+        assert_eq!(iter.next().unwrap(), b"0 bytes copied, 1.0 s, 0 B/s");
         assert_eq!(iter.next().unwrap(), b"");
         assert!(iter.next().is_none());
     }

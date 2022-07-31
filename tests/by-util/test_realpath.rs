@@ -1,6 +1,8 @@
 use crate::common::util::*;
 
-use std::path::Path;
+#[cfg(windows)]
+use regex::Regex;
+use std::path::{Path, MAIN_SEPARATOR};
 
 static GIBBERISH: &str = "supercalifragilisticexpialidocious";
 
@@ -65,50 +67,56 @@ fn test_realpath_file_and_links_zero() {
 
 #[test]
 fn test_realpath_file_and_links_strip() {
+    let strip_args = ["-s", "--strip", "--no-symlinks"];
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
 
     at.touch("foo");
     at.symlink_file("foo", "bar");
 
-    scene
-        .ucmd()
-        .arg("foo")
-        .arg("-s")
-        .succeeds()
-        .stdout_contains("foo\n");
+    for strip_arg in strip_args {
+        scene
+            .ucmd()
+            .arg("foo")
+            .arg(strip_arg)
+            .succeeds()
+            .stdout_contains("foo\n");
 
-    scene
-        .ucmd()
-        .arg("bar")
-        .arg("-s")
-        .succeeds()
-        .stdout_contains("bar\n");
+        scene
+            .ucmd()
+            .arg("bar")
+            .arg(strip_arg)
+            .succeeds()
+            .stdout_contains("bar\n");
+    }
 }
 
 #[test]
 fn test_realpath_file_and_links_strip_zero() {
+    let strip_args = ["-s", "--strip", "--no-symlinks"];
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
 
     at.touch("foo");
     at.symlink_file("foo", "bar");
 
-    scene
-        .ucmd()
-        .arg("foo")
-        .arg("-s")
-        .arg("-z")
-        .succeeds()
-        .stdout_contains("foo\u{0}");
+    for strip_arg in strip_args {
+        scene
+            .ucmd()
+            .arg("foo")
+            .arg(strip_arg)
+            .arg("-z")
+            .succeeds()
+            .stdout_contains("foo\u{0}");
 
-    scene
-        .ucmd()
-        .arg("bar")
-        .arg("-s")
-        .arg("-z")
-        .succeeds()
-        .stdout_contains("bar\u{0}");
+        scene
+            .ucmd()
+            .arg("bar")
+            .arg(strip_arg)
+            .arg("-z")
+            .succeeds()
+            .stdout_contains("bar\u{0}");
+    }
 }
 
 #[test]
@@ -149,8 +157,8 @@ fn test_realpath_dangling() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.symlink_file("nonexistent-file", "link");
     ucmd.arg("link")
-        .fails()
-        .stderr_contains("realpath: link: No such file or directory");
+        .succeeds()
+        .stdout_contains(at.plus_as_string("nonexistent-file\n"));
 }
 
 #[test]
@@ -160,8 +168,8 @@ fn test_realpath_loop() {
     at.symlink_file("3", "2");
     at.symlink_file("1", "3");
     ucmd.arg("1")
-        .succeeds()
-        .stdout_only(at.plus_as_string("2\n"));
+        .fails()
+        .stderr_contains("Too many levels of symbolic links");
 }
 
 #[test]
@@ -213,7 +221,7 @@ fn test_realpath_when_symlink_is_absolute_and_enoent() {
     at.mkdir("dir1");
     at.symlink_file("dir2/bar", "dir1/foo1");
     at.symlink_file("/dir2/bar", "dir1/foo2");
-    at.relative_symlink_file("dir2/baz", at.plus("dir1/foo3").to_str().unwrap());
+    at.relative_symlink_file("../dir2/baz", "dir1/foo3");
 
     #[cfg(unix)]
     ucmd.arg("dir1/foo1")
@@ -222,7 +230,7 @@ fn test_realpath_when_symlink_is_absolute_and_enoent() {
         .run()
         .stdout_contains("/dir2/bar\n")
         .stdout_contains("/dir2/baz\n")
-        .stderr_is("realpath: dir1/foo2: No such file or directory");
+        .stderr_is("realpath: dir1/foo2: No such file or directory\n");
 
     #[cfg(windows)]
     ucmd.arg("dir1/foo1")
@@ -232,4 +240,127 @@ fn test_realpath_when_symlink_is_absolute_and_enoent() {
         .stdout_contains("\\dir2\\bar\n")
         .stdout_contains("\\dir2\\baz\n")
         .stderr_is("realpath: dir1/foo2: No such file or directory");
+}
+
+#[test]
+fn test_realpath_when_symlink_part_is_missing() {
+    let (at, mut ucmd) = at_and_ucmd!();
+
+    at.mkdir("dir2");
+    at.touch("dir2/bar");
+
+    at.mkdir("dir1");
+    at.relative_symlink_file("../dir2/bar", "dir1/foo1");
+    at.relative_symlink_file("dir2/bar", "dir1/foo2");
+    at.relative_symlink_file("../dir2/baz", "dir1/foo3");
+    at.symlink_file("dir3/bar", "dir1/foo4");
+
+    let expect1 = format!("dir2{}bar", MAIN_SEPARATOR);
+    let expect2 = format!("dir2{}baz", MAIN_SEPARATOR);
+
+    ucmd.args(&["dir1/foo1", "dir1/foo2", "dir1/foo3", "dir1/foo4"])
+        .run()
+        .stdout_contains(expect1 + "\n")
+        .stdout_contains(expect2 + "\n")
+        .stderr_contains("realpath: dir1/foo2: No such file or directory\n")
+        .stderr_contains("realpath: dir1/foo4: No such file or directory\n");
+}
+
+#[test]
+fn test_relative_existing_require_directories() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir1");
+    at.touch("dir1/f");
+    ucmd.args(&["-e", "--relative-base=.", "--relative-to=dir1/f", "."])
+        .fails()
+        .code_is(1)
+        .stderr_contains("directory");
+}
+
+#[test]
+fn test_relative_existing_require_directories_2() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir1");
+    at.touch("dir1/f");
+    ucmd.args(&["-e", "--relative-base=.", "--relative-to=dir1", "."])
+        .succeeds()
+        .stdout_is("..\n");
+}
+
+#[test]
+fn test_relative_base_not_prefix_of_relative_to() {
+    let result = new_ucmd!()
+        .args(&[
+            "-sm",
+            "--relative-base=/usr/local",
+            "--relative-to=/usr",
+            "/usr",
+            "/usr/local",
+        ])
+        .succeeds();
+
+    #[cfg(windows)]
+    result.stdout_matches(&Regex::new(r"^.*:\\usr\n.*:\\usr\\local$").unwrap());
+
+    #[cfg(not(windows))]
+    result.stdout_is("/usr\n/usr/local\n");
+}
+
+#[test]
+fn test_relative_string_handling() {
+    let result = new_ucmd!()
+        .args(&["-m", "--relative-to=prefix", "prefixed/1"])
+        .succeeds();
+    #[cfg(not(windows))]
+    result.stdout_is("../prefixed/1\n");
+    #[cfg(windows)]
+    result.stdout_is("..\\prefixed\\1\n");
+
+    let result = new_ucmd!()
+        .args(&["-m", "--relative-to=prefixed", "prefix/1"])
+        .succeeds();
+    #[cfg(not(windows))]
+    result.stdout_is("../prefix/1\n");
+    #[cfg(windows)]
+    result.stdout_is("..\\prefix\\1\n");
+
+    new_ucmd!()
+        .args(&["-m", "--relative-to=prefixed", "prefixed/1"])
+        .succeeds()
+        .stdout_is("1\n");
+}
+
+#[test]
+fn test_relative() {
+    let result = new_ucmd!()
+        .args(&[
+            "-sm",
+            "--relative-base=/usr",
+            "--relative-to=/usr",
+            "/tmp",
+            "/usr",
+        ])
+        .succeeds();
+    #[cfg(not(windows))]
+    result.stdout_is("/tmp\n.\n");
+    #[cfg(windows)]
+    result.stdout_matches(&Regex::new(r"^.*:\\tmp\n\.$").unwrap());
+
+    new_ucmd!()
+        .args(&["-sm", "--relative-base=/", "--relative-to=/", "/", "/usr"])
+        .succeeds()
+        .stdout_is(".\nusr\n"); // spell-checker:disable-line
+
+    let result = new_ucmd!()
+        .args(&["-sm", "--relative-base=/usr", "/tmp", "/usr"])
+        .succeeds();
+    #[cfg(not(windows))]
+    result.stdout_is("/tmp\n.\n");
+    #[cfg(windows)]
+    result.stdout_matches(&Regex::new(r"^.*:\\tmp\n\.$").unwrap());
+
+    new_ucmd!()
+        .args(&["-sm", "--relative-base=/", "/", "/usr"])
+        .succeeds()
+        .stdout_is(".\nusr\n"); // spell-checker:disable-line
 }

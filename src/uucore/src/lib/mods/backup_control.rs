@@ -148,7 +148,7 @@ pub enum BackupError {
 impl UError for BackupError {
     fn code(&self) -> i32 {
         match self {
-            BackupError::BackupImpossible() => 2,
+            Self::BackupImpossible() => 2,
             _ => 1,
         }
     }
@@ -157,7 +157,7 @@ impl UError for BackupError {
         // Suggested by clippy.
         matches!(
             self,
-            BackupError::InvalidArgument(_, _) | BackupError::AmbiguousArgument(_, _)
+            Self::InvalidArgument(_, _) | Self::AmbiguousArgument(_, _)
         )
     }
 }
@@ -166,25 +166,24 @@ impl Error for BackupError {}
 
 impl Display for BackupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use BackupError as BE;
         match self {
-            BE::InvalidArgument(arg, origin) => write!(
+            Self::InvalidArgument(arg, origin) => write!(
                 f,
                 "invalid argument {} for '{}'\n{}",
                 arg.quote(),
                 origin,
                 VALID_ARGS_HELP
             ),
-            BE::AmbiguousArgument(arg, origin) => write!(
+            Self::AmbiguousArgument(arg, origin) => write!(
                 f,
                 "ambiguous argument {} for '{}'\n{}",
                 arg.quote(),
                 origin,
                 VALID_ARGS_HELP
             ),
-            BE::BackupImpossible() => write!(f, "cannot create backup"),
+            Self::BackupImpossible() => write!(f, "cannot create backup"),
             // Placeholder for later
-            // BE::BackupFailed(from, to, e) => Display::fmt(
+            // Self::BackupFailed(from, to, e) => Display::fmt(
             //     &uio_error!(e, "failed to backup {} to {}", from.quote(), to.quote()),
             //     f
             // ),
@@ -447,7 +446,7 @@ mod tests {
     use std::env;
     // Required to instantiate mutex in shared context
     use clap::Command;
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
     use std::sync::Mutex;
 
     // The mutex is required here as by default all tests are run as separate
@@ -456,9 +455,7 @@ mod tests {
     // occur if no precautions are taken. Thus we have all tests that rely on
     // environment variables lock this empty mutex to ensure they don't access
     // it concurrently.
-    lazy_static! {
-        static ref TEST_MUTEX: Mutex<()> = Mutex::new(());
-    }
+    static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     // Environment variable for "VERSION_CONTROL"
     static ENV_VERSION_CONTROL: &str = "VERSION_CONTROL";

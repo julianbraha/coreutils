@@ -1,4 +1,4 @@
-// spell-checker:ignore (words) READMECAREFULLY birthtime doesntexist oneline somebackup lrwx somefile somegroup somehiddenbackup somehiddenfile
+// spell-checker:ignore (words) READMECAREFULLY birthtime doesntexist oneline somebackup lrwx somefile somegroup somehiddenbackup somehiddenfile tabsize aaaaaaaa bbbb cccc dddddddd ncccc
 
 #[cfg(not(windows))]
 extern crate libc;
@@ -18,15 +18,8 @@ use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 #[cfg(not(windows))]
 use std::path::PathBuf;
-#[cfg(not(windows))]
-use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
-
-#[cfg(not(windows))]
-lazy_static! {
-    static ref UMASK_MUTEX: Mutex<()> = Mutex::new(());
-}
 
 const LONG_ARGS: &[&str] = &[
     "-l",
@@ -650,6 +643,21 @@ fn test_ls_width() {
             .stdout_only("test-width-1  test-width-2  test-width-3  test-width-4\n");
     }
 
+    for option in [
+        "-w 062",
+        "-w=062",
+        "--width=062",
+        "--width 062",
+        "--wid=062",
+    ] {
+        scene
+            .ucmd()
+            .args(&option.split(' ').collect::<Vec<_>>())
+            .arg("-C")
+            .succeeds()
+            .stdout_only("test-width-1  test-width-3\ntest-width-2  test-width-4\n");
+    }
+
     scene
         .ucmd()
         .arg("-w=bad")
@@ -786,6 +794,30 @@ fn test_ls_commas() {
             .succeeds()
             .stdout_only("test-commas-1, test-commas-2, test-commas-3,\ntest-commas-4\n");
     }
+}
+
+#[test]
+fn test_ls_commas_trailing() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.touch(&at.plus_as_string("test-commas-trailing-2"));
+
+    at.touch(&at.plus_as_string("test-commas-trailing-1"));
+    at.append(
+        "test-commas-trailing-1",
+        &(0..2000)
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    scene
+        .ucmd()
+        .arg("-sm")
+        .arg("./test-commas-trailing-1")
+        .arg("./test-commas-trailing-2")
+        .succeeds()
+        .stdout_matches(&Regex::new(r"\S$").unwrap()); // matches if there is no whitespace at the end of stdout.
 }
 
 #[test]
@@ -3025,4 +3057,96 @@ fn test_ls_quoting_color() {
         .arg("symlink")
         .succeeds()
         .stdout_contains("\'need quoting\'");
+}
+
+#[test]
+fn test_ls_dereference_looped_symlinks_recursive() {
+    let (at, mut ucmd) = at_and_ucmd!();
+
+    at.mkdir("loop");
+    at.relative_symlink_dir("../loop", "loop/sub");
+
+    ucmd.args(&["-RL", "loop"])
+        .fails()
+        .stderr_contains("not listing already-listed directory");
+}
+
+#[test]
+fn test_dereference_dangling_color() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.relative_symlink_file("wat", "nonexistent");
+    let out_exp = ucmd.args(&["--color"]).run().stdout_move_str();
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.relative_symlink_file("wat", "nonexistent");
+    ucmd.args(&["-L", "--color"])
+        .fails()
+        .code_is(1)
+        .stderr_contains("No such file or directory")
+        .stdout_is(out_exp);
+}
+
+#[test]
+fn test_dereference_symlink_dir_color() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir1");
+    at.mkdir("dir1/link");
+    let out_exp = ucmd.args(&["--color", "dir1"]).run().stdout_move_str();
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir1");
+    at.mkdir("dir2");
+    at.relative_symlink_dir("../dir2", "dir1/link");
+    ucmd.args(&["-L", "--color", "dir1"])
+        .succeeds()
+        .stdout_is(out_exp);
+}
+
+#[test]
+fn test_dereference_symlink_file_color() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir1");
+    at.touch("dir1/link");
+    let out_exp = ucmd.args(&["--color", "dir1"]).run().stdout_move_str();
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir1");
+    at.touch("file");
+    at.relative_symlink_file("../file", "dir1/link");
+    ucmd.args(&["-L", "--color", "dir1"])
+        .succeeds()
+        .stdout_is(out_exp);
+}
+
+#[test]
+fn test_tabsize_option() {
+    let scene = TestScenario::new(util_name!());
+
+    scene.ucmd().args(&["-T", "3"]).succeeds();
+    scene.ucmd().args(&["--tabsize", "0"]).succeeds();
+    scene.ucmd().arg("-T").fails();
+}
+
+#[ignore = "issue #3624"]
+#[test]
+fn test_tabsize_formatting() {
+    let (at, mut ucmd) = at_and_ucmd!();
+
+    at.touch("aaaaaaaa");
+    at.touch("bbbb");
+    at.touch("cccc");
+    at.touch("dddddddd");
+
+    ucmd.args(&["-T", "4"])
+        .succeeds()
+        .stdout_is("aaaaaaaa bbbb\ncccc\t dddddddd");
+
+    ucmd.args(&["-T", "2"])
+        .succeeds()
+        .stdout_is("aaaaaaaa bbbb\ncccc\t\t dddddddd");
+
+    // use spaces
+    ucmd.args(&["-T", "0"])
+        .succeeds()
+        .stdout_is("aaaaaaaa bbbb\ncccc     dddddddd");
 }

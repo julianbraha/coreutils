@@ -9,6 +9,8 @@ use std::os::unix::fs;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink as symlink_file;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(all(unix, not(target_os = "freebsd")))]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
@@ -24,6 +26,7 @@ use std::fs as std_fs;
 use std::thread::sleep;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::time::Duration;
+use uucore::display::Quotable;
 
 static TEST_EXISTING_FILE: &str = "existing_file.txt";
 static TEST_HELLO_WORLD_SOURCE: &str = "hello_world.txt";
@@ -556,6 +559,24 @@ fn test_cp_backup_simple() {
         at.read(&*format!("{}~", TEST_HOW_ARE_YOU_SOURCE)),
         "How are you?\n"
     );
+}
+
+#[test]
+fn test_cp_backup_simple_protect_source() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let source = format!("{}~", TEST_HELLO_WORLD_SOURCE);
+    at.touch(&source);
+    ucmd.arg("--backup=simple")
+        .arg(&source)
+        .arg(TEST_HELLO_WORLD_SOURCE)
+        .fails()
+        .stderr_only(format!(
+            "cp: backing up '{}' might destroy source;  '{}' not copied",
+            TEST_HELLO_WORLD_SOURCE, source,
+        ));
+
+    assert_eq!(at.read(TEST_HELLO_WORLD_SOURCE), "Hello, World!\n");
+    assert_eq!(at.read(&source), "");
 }
 
 #[test]
@@ -1474,13 +1495,12 @@ fn test_copy_through_just_created_symlink() {
         at.mkdir("a");
         at.mkdir("b");
         at.mkdir("c");
-        #[cfg(unix)]
-        fs::symlink("../t", at.plus("a/1")).unwrap();
-        #[cfg(target_os = "windows")]
-        symlink_file("../t", at.plus("a/1")).unwrap();
+        at.relative_symlink_file("../t", "a/1");
         at.touch("b/1");
+        at.write("b/1", "hello");
         if create_t {
             at.touch("t");
+            at.write("t", "world");
         }
         ucmd.arg("--no-dereference")
             .arg("a/1")
@@ -1492,6 +1512,9 @@ fn test_copy_through_just_created_symlink() {
             } else {
                 "cp: will not copy 'b/1' through just-created symlink 'c\\1'"
             });
+        if create_t {
+            assert_eq!(at.read("a/1"), "world");
+        }
     }
 }
 
@@ -1516,6 +1539,47 @@ fn test_copy_through_dangling_symlink_no_dereference() {
         .succeeds()
         .no_stderr()
         .no_stdout();
+}
+
+/// Test for copying a dangling symbolic link and its permissions.
+#[test]
+fn test_copy_through_dangling_symlink_no_dereference_permissions() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    //               target name    link name
+    at.symlink_file("no-such-file", "dangle");
+    //          don't dereference the link
+    //           |    copy permissions, too
+    //           |      |    from the link
+    //           |      |      |     to new file d2
+    //           |      |      |        |
+    //           V      V      V        V
+    ucmd.args(&["-P", "-p", "dangle", "d2"])
+        .succeeds()
+        .no_stderr()
+        .no_stdout();
+    assert!(at.symlink_exists("d2"));
+
+    // `-p` means `--preserve=mode,ownership,timestamps`
+    #[cfg(unix)]
+    {
+        let metadata1 = at.symlink_metadata("dangle");
+        let metadata2 = at.symlink_metadata("d2");
+        assert_eq!(metadata1.mode(), metadata2.mode());
+        assert_eq!(metadata1.uid(), metadata2.uid());
+        assert_eq!(metadata1.atime(), metadata2.atime());
+        assert_eq!(metadata1.mtime(), metadata2.mtime());
+        assert_eq!(metadata1.ctime(), metadata2.ctime());
+    }
+}
+
+#[test]
+fn test_copy_through_dangling_symlink_no_dereference_2() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("file");
+    at.symlink_file("nonexistent", "target");
+    ucmd.args(&["-P", "file", "target"])
+        .fails()
+        .stderr_only("cp: not writing through dangling symlink 'target'");
 }
 
 #[test]
@@ -1639,4 +1703,97 @@ fn test_cp_overriding_arguments() {
             .succeeds();
         s.fixtures.remove("file2");
     }
+}
+
+#[test]
+fn test_copy_no_dereference_1() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("a");
+    at.mkdir("b");
+    at.touch("a/foo");
+    at.write("a/foo", "bar");
+    at.relative_symlink_file("../a/foo", "b/foo");
+    ucmd.args(&["-P", "a/foo", "b"]).fails();
+}
+
+#[test]
+fn test_abuse_existing() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("a");
+    at.mkdir("b");
+    at.mkdir("c");
+    at.relative_symlink_file("../t", "a/1");
+    at.touch("b/1");
+    at.write("b/1", "hello");
+    at.relative_symlink_file("../t", "c/1");
+    at.touch("t");
+    at.write("t", "i");
+    ucmd.args(&["-dR", "a/1", "b/1", "c"])
+        .fails()
+        .stderr_contains(format!(
+            "will not copy 'b/1' through just-created symlink 'c{}1'",
+            if cfg!(windows) { "\\" } else { "/" }
+        ));
+    assert_eq!(at.read("t"), "i");
+}
+
+#[test]
+fn test_copy_same_symlink_no_dereference() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.relative_symlink_file("t", "a");
+    at.relative_symlink_file("t", "b");
+    at.touch("t");
+    ucmd.args(&["-d", "a", "b"]).succeeds();
+}
+
+#[test]
+fn test_copy_same_symlink_no_dereference_dangling() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.relative_symlink_file("t", "a");
+    at.relative_symlink_file("t", "b");
+    ucmd.args(&["-d", "a", "b"]).succeeds();
+}
+
+#[test]
+#[ignore = "issue #3332"]
+fn test_cp_parents_2() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("a/b");
+    at.touch("a/b/c");
+    at.mkdir("d");
+    ucmd.args(&["--verbose", "-a", "--parents", "a/b/c", "d"])
+        .succeeds()
+        .stdout_is(format!(
+            "{} -> {}\n{} -> {}\n{} -> {}\n",
+            "a",
+            path_concat!("d", "a"),
+            path_concat!("a", "b"),
+            path_concat!("d", "a", "b"),
+            path_concat!("a", "b", "c").quote(),
+            path_concat!("d", "a", "b", "c").quote()
+        ));
+    assert!(at.file_exists("d/a/b/c"));
+}
+
+#[test]
+#[ignore = "issue #3332"]
+fn test_cp_parents_2_link() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("a/b");
+    at.touch("a/b/c");
+    at.mkdir("d");
+    at.relative_symlink_file("b", "a/link");
+    ucmd.args(&["--verbose", "-a", "--parents", "a/link/c", "d"])
+        .succeeds()
+        .stdout_is(format!(
+            "{} -> {}\n{} -> {}\n{} -> {}\n",
+            "a",
+            path_concat!("d", "a"),
+            path_concat!("a", "link"),
+            path_concat!("d", "a", "link"),
+            path_concat!("a", "link", "c").quote(),
+            path_concat!("d", "a", "link", "c").quote()
+        ));
+    assert!(at.dir_exists("d/a/link") && !at.symlink_exists("d/a/link"));
+    assert!(at.file_exists("d/a/link/c"));
 }

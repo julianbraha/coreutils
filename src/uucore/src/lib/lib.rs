@@ -24,6 +24,7 @@ pub use crate::mods::display;
 pub use crate::mods::error;
 pub use crate::mods::os;
 pub use crate::mods::panic;
+pub use crate::mods::quoting_style;
 pub use crate::mods::ranges;
 pub use crate::mods::version_cmp;
 
@@ -189,8 +190,8 @@ impl ConversionResult {
 pub trait Args: Iterator<Item = OsString> + Sized {
     /// Converts each iterator item to a String and collects these into a vector
     /// On invalid encoding, the result will depend on the argument. This method allows to either drop entries with illegal encoding
-    /// completely (```InvalidEncodingHandling::Ignore```), convert them using lossy-conversion (```InvalidEncodingHandling::Lossy```) which will
-    /// result in strange strings or can chosen to panic (```InvalidEncodingHandling::Panic```).
+    /// completely (```InvalidEncodingHandling::Ignore```), convert them using lossy-conversion (```InvalidEncodingHandling::ConvertLossy```)
+    /// which will result in strange strings or can chosen to panic (```InvalidEncodingHandling::Panic```).
     /// # Arguments
     /// * `handling` - This switch allows to switch the behavior, when invalid encoding is encountered
     /// # Panics

@@ -73,7 +73,7 @@ enum InstallError {
 impl UError for InstallError {
     fn code(&self) -> i32 {
         match self {
-            InstallError::Unimplemented(_) => 2,
+            Self::Unimplemented(_) => 2,
             _ => 1,
         }
     }
@@ -87,41 +87,40 @@ impl Error for InstallError {}
 
 impl Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use InstallError as IE;
         match self {
-            IE::Unimplemented(opt) => write!(f, "Unimplemented feature: {}", opt),
-            IE::DirNeedsArg() => {
+            Self::Unimplemented(opt) => write!(f, "Unimplemented feature: {}", opt),
+            Self::DirNeedsArg() => {
                 write!(
                     f,
                     "{} with -d requires at least one argument.",
                     uucore::util_name()
                 )
             }
-            IE::CreateDirFailed(dir, e) => {
+            Self::CreateDirFailed(dir, e) => {
                 Display::fmt(&uio_error!(e, "failed to create {}", dir.quote()), f)
             }
-            IE::ChmodFailed(file) => write!(f, "failed to chmod {}", file.quote()),
-            IE::InvalidTarget(target) => write!(
+            Self::ChmodFailed(file) => write!(f, "failed to chmod {}", file.quote()),
+            Self::InvalidTarget(target) => write!(
                 f,
                 "invalid target {}: No such file or directory",
                 target.quote()
             ),
-            IE::TargetDirIsntDir(target) => {
+            Self::TargetDirIsntDir(target) => {
                 write!(f, "target {} is not a directory", target.quote())
             }
-            IE::BackupFailed(from, to, e) => Display::fmt(
+            Self::BackupFailed(from, to, e) => Display::fmt(
                 &uio_error!(e, "cannot backup {} to {}", from.quote(), to.quote()),
                 f,
             ),
-            IE::InstallFailed(from, to, e) => Display::fmt(
+            Self::InstallFailed(from, to, e) => Display::fmt(
                 &uio_error!(e, "cannot install {} to {}", from.quote(), to.quote()),
                 f,
             ),
-            IE::StripProgramFailed(msg) => write!(f, "strip program failed: {}", msg),
-            IE::MetadataFailed(e) => Display::fmt(&uio_error!(e, ""), f),
-            IE::NoSuchUser(user) => write!(f, "no such user: {}", user.maybe_quote()),
-            IE::NoSuchGroup(group) => write!(f, "no such group: {}", group.maybe_quote()),
-            IE::OmittingDirectory(dir) => write!(f, "omitting directory {}", dir.quote()),
+            Self::StripProgramFailed(msg) => write!(f, "strip program failed: {}", msg),
+            Self::MetadataFailed(e) => Display::fmt(&uio_error!(e, ""), f),
+            Self::NoSuchUser(user) => write!(f, "no such user: {}", user.maybe_quote()),
+            Self::NoSuchGroup(group) => write!(f, "no such group: {}", group.maybe_quote()),
+            Self::OmittingDirectory(dir) => write!(f, "omitting directory {}", dir.quote()),
         }
     }
 }
@@ -370,6 +369,17 @@ fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
     let backup_mode = backup_control::determine_backup_mode(matches)?;
     let target_dir = matches.value_of(OPT_TARGET_DIRECTORY).map(|d| d.to_owned());
 
+    let preserve_timestamps = matches.is_present(OPT_PRESERVE_TIMESTAMPS);
+    let compare = matches.is_present(OPT_COMPARE);
+    let strip = matches.is_present(OPT_STRIP);
+    if preserve_timestamps && compare {
+        show_error!("Options --compare and --preserve-timestamps are mutually exclusive");
+        return Err(1.into());
+    }
+    if compare && strip {
+        show_error!("Options --compare and --strip are mutually exclusive");
+        return Err(1.into());
+    }
     Ok(Behavior {
         main_function,
         specified_mode,
@@ -378,9 +388,9 @@ fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
         owner: matches.value_of(OPT_OWNER).unwrap_or("").to_string(),
         group: matches.value_of(OPT_GROUP).unwrap_or("").to_string(),
         verbose: matches.is_present(OPT_VERBOSE),
-        preserve_timestamps: matches.is_present(OPT_PRESERVE_TIMESTAMPS),
-        compare: matches.is_present(OPT_COMPARE),
-        strip: matches.is_present(OPT_STRIP),
+        preserve_timestamps,
+        compare,
+        strip,
         strip_program: String::from(
             matches
                 .value_of(OPT_STRIP_PROGRAM)
@@ -471,13 +481,19 @@ fn standard(mut paths: Vec<String>, b: &Behavior) -> UResult<()> {
     if sources.len() > 1 || (target.exists() && target.is_dir()) {
         copy_files_into_dir(sources, &target, b)
     } else {
-        if let Some(parent) = target.parent() {
-            if !parent.exists() && b.create_leading {
+        // if -t is used in combination with -D, create whole target because it does not include filename
+        let to_create: Option<&Path> = if b.target_dir.is_some() && b.create_leading {
+            Some(target.as_path())
+        } else {
+            target.parent()
+        };
+
+        if let Some(to_create) = to_create {
+            if !to_create.exists() && b.create_leading {
                 if b.verbose {
                     let mut result = PathBuf::new();
-                    // When creating directories with -Dv, show directory creations step
-                    // by step
-                    for part in parent.components() {
+                    // When creating directories with -Dv, show directory creations step by step
+                    for part in to_create.components() {
                         result.push(part.as_os_str());
                         if !Path::new(part.as_os_str()).is_dir() {
                             // Don't display when the directory already exists
@@ -486,32 +502,39 @@ fn standard(mut paths: Vec<String>, b: &Behavior) -> UResult<()> {
                     }
                 }
 
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return Err(InstallError::CreateDirFailed(parent.to_path_buf(), e).into());
+                if let Err(e) = fs::create_dir_all(to_create) {
+                    return Err(InstallError::CreateDirFailed(to_create.to_path_buf(), e).into());
                 }
 
                 // Silent the warning as we want to the error message
                 #[allow(clippy::question_mark)]
-                if mode::chmod(parent, b.mode()).is_err() {
-                    return Err(InstallError::ChmodFailed(parent.to_path_buf()).into());
+                if mode::chmod(to_create, b.mode()).is_err() {
+                    return Err(InstallError::ChmodFailed(to_create.to_path_buf()).into());
                 }
             }
         }
 
-        if target.is_file() || is_new_file_path(&target) {
-            copy(
-                sources.get(0).ok_or_else(|| {
-                    UUsageError::new(
-                        1,
-                        format!(
-                            "missing destination file operand after '{}'",
-                            target.to_str().unwrap()
-                        ),
-                    )
-                })?,
-                &target,
-                b,
+        let source = sources.first().ok_or_else(|| {
+            UUsageError::new(
+                1,
+                format!(
+                    "missing destination file operand after '{}'",
+                    target.to_str().unwrap()
+                ),
             )
+        })?;
+
+        // If the -D flag was passed (target does not include filename),
+        // we need to add the source name to the target_dir
+        // because `copy` expects `to` to be a file, not a directory
+        let target = if target.is_dir() && b.create_leading {
+            target.join(source)
+        } else {
+            target // already includes dest filename
+        };
+
+        if target.is_file() || is_new_file_path(&target) {
+            copy(source, &target, b)
         } else {
             Err(InstallError::InvalidTarget(target).into())
         }
@@ -585,6 +608,9 @@ fn copy(from: &Path, to: &Path, b: &Behavior) -> UResult<()> {
     // The codes actually making use of the backup process don't seem to agree
     // on how best to approach the issue. (mv and ln, for example)
     if to.exists() {
+        if b.verbose {
+            println!("removed {}", to.quote());
+        }
         backup_path = backup_control::get_backup_path(b.backup_mode, to, &b.suffix);
         if let Some(ref backup_path) = backup_path {
             // TODO!!
@@ -754,11 +780,16 @@ fn need_copy(from: &Path, to: &Path, b: &Behavior) -> UResult<bool> {
 
     // setuid || setgid || sticky
     let extra_mode: u32 = 0o7000;
+    // setuid || setgid || sticky || permissions
+    let all_modes: u32 = 0o7777;
 
     if b.specified_mode.unwrap_or(0) & extra_mode != 0
         || from_meta.mode() & extra_mode != 0
         || to_meta.mode() & extra_mode != 0
     {
+        return Ok(true);
+    }
+    if b.mode() != to_meta.mode() & all_modes {
         return Ok(true);
     }
 

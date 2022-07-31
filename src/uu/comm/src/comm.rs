@@ -33,7 +33,10 @@ mod options {
 
 fn mkdelim(col: usize, opts: &ArgMatches) -> String {
     let mut s = String::new();
-    let delim = opts.value_of(options::DELIMITER).unwrap();
+    let delim = match opts.value_of(options::DELIMITER).unwrap() {
+        "" => "\0",
+        delim => delim,
+    };
 
     if col > 1 && !opts.is_present(options::COLUMN_1) {
         s.push_str(delim.as_ref());
@@ -59,8 +62,8 @@ enum LineReader {
 impl LineReader {
     fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
         match *self {
-            LineReader::Stdin(ref mut r) => r.read_line(buf),
-            LineReader::FileIn(ref mut r) => r.read_line(buf),
+            Self::Stdin(ref mut r) => r.read_line(buf),
+            Self::FileIn(ref mut r) => r.read_line(buf),
         }
     }
 }

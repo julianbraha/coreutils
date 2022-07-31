@@ -10,7 +10,7 @@ use crate::error::strip_errno;
 use crate::error::UResult;
 use crate::error::USimpleError;
 pub use crate::features::entries;
-use crate::fs::resolve_relative_path;
+use crate::fs::{is_symlink, resolve_relative_path};
 use crate::show_error;
 use clap::Arg;
 use clap::ArgMatches;
@@ -29,14 +29,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 /// The various level of verbosity
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum VerbosityLevel {
     Silent,
     Changes,
     Verbose,
     Normal,
 }
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct Verbosity {
     pub groups_only: bool,
     pub level: VerbosityLevel,
@@ -274,12 +274,7 @@ impl ChownExecutor {
         let root = root.as_ref();
 
         // walkdir always dereferences the root directory, so we have to check it ourselves
-        // TODO: replace with `root.is_symlink()` once it is stable
-        if self.traverse_symlinks == TraverseSymlinks::None
-            && std::fs::symlink_metadata(root)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-        {
+        if self.traverse_symlinks == TraverseSymlinks::None && is_symlink(root) {
             return 0;
         }
 

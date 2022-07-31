@@ -8,7 +8,7 @@
 #[macro_use]
 extern crate uucore;
 use uucore::display::Quotable;
-use uucore::error::{UResult, USimpleError};
+use uucore::error::{FromIo, UResult, USimpleError};
 use uucore::fs::display_permissions;
 use uucore::fsext::{
     pretty_filetype, pretty_fstype, pretty_time, read_fs_list, statfs, BirthTime, FsMeta,
@@ -109,7 +109,7 @@ pub const F_SIGN: u8 = 1 << 4;
 // unused at present
 pub const F_GROUP: u8 = 1 << 5;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum OutputType {
     Str,
     Integer,
@@ -119,7 +119,7 @@ pub enum OutputType {
     Unknown,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Token {
     Char(char),
     Directive {
@@ -502,6 +502,7 @@ impl Stater {
             None
         } else {
             let mut mount_list = read_fs_list()
+                .map_err_context(|| "cannot read table of mounted file systems".into())?
                 .iter()
                 .map(|mi| mi.mount_dir.clone())
                 .collect::<Vec<String>>();

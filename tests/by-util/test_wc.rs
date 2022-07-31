@@ -60,7 +60,133 @@ fn test_utf8() {
 }
 
 #[test]
-fn test_utf8_extra() {
+fn test_utf8_words() {
+    new_ucmd!()
+        .arg("-w")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("87\n");
+}
+
+#[test]
+fn test_utf8_line_length_words() {
+    new_ucmd!()
+        .arg("-Lw")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     87      48\n");
+}
+
+#[test]
+fn test_utf8_line_length_chars() {
+    new_ucmd!()
+        .arg("-Lm")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("    442      48\n");
+}
+
+#[test]
+fn test_utf8_line_length_chars_words() {
+    new_ucmd!()
+        .arg("-Lmw")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     87     442      48\n");
+}
+
+#[test]
+fn test_utf8_chars() {
+    new_ucmd!()
+        .arg("-m")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("442\n");
+}
+
+#[test]
+fn test_utf8_bytes_chars() {
+    new_ucmd!()
+        .arg("-cm")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("    442     513\n");
+}
+
+#[test]
+fn test_utf8_bytes_lines() {
+    new_ucmd!()
+        .arg("-cl")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     25     513\n");
+}
+
+#[test]
+fn test_utf8_bytes_chars_lines() {
+    new_ucmd!()
+        .arg("-cml")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     25     442     513\n");
+}
+
+#[test]
+fn test_utf8_chars_words() {
+    new_ucmd!()
+        .arg("-mw")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     87     442\n");
+}
+
+#[test]
+fn test_utf8_line_length_lines() {
+    new_ucmd!()
+        .arg("-Ll")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     25      48\n");
+}
+
+#[test]
+fn test_utf8_line_length_lines_words() {
+    new_ucmd!()
+        .arg("-Llw")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     25      87      48\n");
+}
+
+#[test]
+fn test_utf8_lines_chars() {
+    new_ucmd!()
+        .arg("-ml")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     25     442\n");
+}
+
+#[test]
+fn test_utf8_lines_words_chars() {
+    new_ucmd!()
+        .arg("-mlw")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     25      87     442\n");
+}
+
+#[test]
+fn test_utf8_line_length_lines_chars() {
+    new_ucmd!()
+        .arg("-Llm")
+        .pipe_in_fixture("UTF_8_weirdchars.txt")
+        .run()
+        .stdout_is("     25     442      48\n");
+}
+
+#[test]
+fn test_utf8_all() {
     new_ucmd!()
         .arg("-lwmcL")
         .pipe_in_fixture("UTF_8_weirdchars.txt")
@@ -117,6 +243,20 @@ fn test_single_all_counts() {
         .args(&["-c", "-l", "-L", "-m", "-w", "alice_in_wonderland.txt"])
         .run()
         .stdout_is("  5  57 302 302  66 alice_in_wonderland.txt\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_gnu_compatible_quotation() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.mkdir("some-dir1");
+    at.touch("some-dir1/12\n34.txt");
+    scene
+        .ucmd()
+        .args(&["some-dir1/12\n34.txt"])
+        .run()
+        .stdout_is("0 0 0 'some-dir1/12'$'\\n''34.txt'\n");
 }
 
 #[test]

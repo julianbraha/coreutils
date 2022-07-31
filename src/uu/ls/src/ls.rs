@@ -5,23 +5,17 @@
 // For the full copyright and license information, please view the LICENSE file
 // that was distributed with this source code.
 
-// spell-checker:ignore (ToDO) cpio svgz webm somegroup nlink rmvb xspf
+// spell-checker:ignore (ToDO) cpio svgz webm somegroup nlink rmvb xspf tabsize
 
 #[macro_use]
 extern crate uucore;
-#[cfg(unix)]
-#[macro_use]
-extern crate lazy_static;
-
-// dir and vdir also need access to the quoting_style module
-pub mod quoting_style;
 
 use clap::{crate_version, Arg, Command};
 use glob::Pattern;
 use lscolors::LsColors;
 use number_prefix::NumberPrefix;
 use once_cell::unsync::OnceCell;
-use quoting_style::{escape_name, QuotingStyle};
+use std::collections::HashSet;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::{
@@ -44,6 +38,7 @@ use term_grid::{Cell, Direction, Filling, Grid, GridOptions};
 use unicode_width::UnicodeWidthStr;
 #[cfg(unix)]
 use uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
+use uucore::quoting_style::{escape_name, QuotingStyle};
 use uucore::{
     display::Quotable,
     error::{set_exit_code, UError, UResult},
@@ -67,6 +62,7 @@ pub mod options {
         pub static LONG: &str = "long";
         pub static COLUMNS: &str = "C";
         pub static ACROSS: &str = "x";
+        pub static TAB_SIZE: &str = "tabsize"; // silently ignored (see #3624)
         pub static COMMAS: &str = "m";
         pub static LONG_NO_OWNER: &str = "g";
         pub static LONG_NO_GROUP: &str = "o";
@@ -154,15 +150,17 @@ enum LsError {
     IOError(std::io::Error),
     IOErrorContext(std::io::Error, PathBuf),
     BlockSizeParseError(String),
+    AlreadyListedError(PathBuf),
 }
 
 impl UError for LsError {
     fn code(&self) -> i32 {
         match self {
-            LsError::InvalidLineWidth(_) => 2,
-            LsError::IOError(_) => 1,
-            LsError::IOErrorContext(_, _) => 1,
-            LsError::BlockSizeParseError(_) => 1,
+            Self::InvalidLineWidth(_) => 2,
+            Self::IOError(_) => 1,
+            Self::IOErrorContext(_, _) => 1,
+            Self::BlockSizeParseError(_) => 1,
+            Self::AlreadyListedError(_) => 2,
         }
     }
 }
@@ -172,12 +170,12 @@ impl Error for LsError {}
 impl Display for LsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LsError::BlockSizeParseError(s) => {
+            Self::BlockSizeParseError(s) => {
                 write!(f, "invalid --block-size argument {}", s.quote())
             }
-            LsError::InvalidLineWidth(s) => write!(f, "invalid line width: {}", s.quote()),
-            LsError::IOError(e) => write!(f, "general io error: {}", e),
-            LsError::IOErrorContext(e, p) => {
+            Self::InvalidLineWidth(s) => write!(f, "invalid line width: {}", s.quote()),
+            Self::IOError(e) => write!(f, "general io error: {}", e),
+            Self::IOErrorContext(e, p) => {
                 let error_kind = e.kind();
                 let errno = e.raw_os_error().unwrap_or(1i32);
 
@@ -238,6 +236,13 @@ impl Display for LsError {
                         }
                     },
                 }
+            }
+            Self::AlreadyListedError(path) => {
+                write!(
+                    f,
+                    "{}: not listing already-listed directory",
+                    path.to_string_lossy()
+                )
             }
         }
     }
@@ -569,10 +574,20 @@ impl Config {
         };
 
         let width = match options.value_of(options::WIDTH) {
-            Some(x) => match x.parse::<u16>() {
-                Ok(u) => u,
-                Err(_) => return Err(LsError::InvalidLineWidth(x.into()).into()),
-            },
+            Some(x) => {
+                if x.starts_with('0') && x.len() > 1 {
+                    // Read number as octal
+                    match u16::from_str_radix(x, 8) {
+                        Ok(v) => v,
+                        Err(_) => return Err(LsError::InvalidLineWidth(x.into()).into()),
+                    }
+                } else {
+                    match x.parse::<u16>() {
+                        Ok(u) => u,
+                        Err(_) => return Err(LsError::InvalidLineWidth(x.into()).into()),
+                    }
+                }
+            }
             None => match termsize::get() {
                 Some(size) => size.cols,
                 None => match std::env::var_os("COLUMNS") {
@@ -876,6 +891,15 @@ pub fn uu_app<'a>() -> Command<'a> {
                         options::format::ACROSS,
                         options::format::COLUMNS,
                     ]),
+            )
+            .arg( // silently ignored (see #3624)
+                Arg::new(options::format::TAB_SIZE)
+                    .short('T')
+                    .long(options::format::TAB_SIZE)
+                    .env("TABSIZE")
+                    .takes_value(true)
+                    .value_name("COLS")
+                    .help("Assume tab stops at each COLS instead of 8 (unimplemented)")
             )
             .arg(
                 Arg::new(options::format::COMMAS)
@@ -1481,16 +1505,26 @@ impl PathData {
 
         // Why prefer to check the DirEntry file_type()?  B/c the call is
         // nearly free compared to a metadata() call on a Path
-        let ft = match de {
-            Some(ref de) => {
-                if let Ok(ft_de) = de.file_type() {
-                    OnceCell::from(Some(ft_de))
-                } else if let Ok(md_pb) = p_buf.metadata() {
-                    OnceCell::from(Some(md_pb.file_type()))
-                } else {
-                    OnceCell::new()
+        fn get_file_type(
+            de: &DirEntry,
+            p_buf: &Path,
+            must_dereference: bool,
+        ) -> OnceCell<Option<FileType>> {
+            if must_dereference {
+                if let Ok(md_pb) = p_buf.metadata() {
+                    return OnceCell::from(Some(md_pb.file_type()));
                 }
             }
+            if let Ok(ft_de) = de.file_type() {
+                OnceCell::from(Some(ft_de))
+            } else if let Ok(md_pb) = p_buf.symlink_metadata() {
+                OnceCell::from(Some(md_pb.file_type()))
+            } else {
+                OnceCell::new()
+            }
+        }
+        let ft = match de {
+            Some(ref de) => get_file_type(de, &p_buf, must_dereference),
             None => OnceCell::new(),
         };
 
@@ -1612,7 +1646,12 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
                 writeln!(out, "\n{}:", path_data.p_buf.display())?;
             }
         }
-        enter_directory(path_data, read_dir, config, &mut out)?;
+        let mut listed_ancestors = HashSet::new();
+        listed_ancestors.insert(FileInformation::from_path(
+            &path_data.p_buf,
+            path_data.must_dereference,
+        )?);
+        enter_directory(path_data, read_dir, config, &mut out, &mut listed_ancestors)?;
     }
 
     Ok(())
@@ -1708,6 +1747,7 @@ fn enter_directory(
     read_dir: ReadDir,
     config: &Config,
     out: &mut BufWriter<Stdout>,
+    listed_ancestors: &mut HashSet<FileInformation>,
 ) -> UResult<()> {
     // Create vec of entries with initial dot files
     let mut entries: Vec<PathData> = if config.files == Files::All {
@@ -1773,8 +1813,17 @@ fn enter_directory(
                     continue;
                 }
                 Ok(rd) => {
-                    writeln!(out, "\n{}:", e.p_buf.display())?;
-                    enter_directory(e, rd, config, out)?;
+                    if !listed_ancestors
+                        .insert(FileInformation::from_path(&e.p_buf, e.must_dereference)?)
+                    {
+                        out.flush()?;
+                        show!(LsError::AlreadyListedError(e.p_buf.clone()));
+                    } else {
+                        writeln!(out, "\n{}:", e.p_buf.display())?;
+                        enter_directory(e, rd, config, out, listed_ancestors)?;
+                        listed_ancestors
+                            .remove(&FileInformation::from_path(&e.p_buf, e.must_dereference)?);
+                    }
                 }
             }
         }
@@ -1864,7 +1913,12 @@ fn display_additional_leading_info(
         } else {
             "?".to_owned()
         };
-        write!(result, "{} ", pad_left(&s, padding.block_size)).unwrap();
+        // extra space is insert to align the sizes, as needed for all formats, except for the comma format.
+        if config.format == Format::Commas {
+            write!(result, "{} ", s).unwrap();
+        } else {
+            write!(result, "{} ", pad_left(&s, padding.block_size)).unwrap();
+        };
     }
     Ok(result)
 }
@@ -2239,15 +2293,17 @@ fn get_inode(metadata: &Metadata) -> String {
 // Currently getpwuid is `linux` target only. If it's broken out into
 // a posix-compliant attribute this can be updated...
 #[cfg(unix)]
+use once_cell::sync::Lazy;
+#[cfg(unix)]
 use std::sync::Mutex;
 #[cfg(unix)]
 use uucore::entries;
+use uucore::fs::FileInformation;
+use uucore::quoting_style;
 
 #[cfg(unix)]
 fn cached_uid2usr(uid: u32) -> String {
-    lazy_static! {
-        static ref UID_CACHE: Mutex<HashMap<u32, String>> = Mutex::new(HashMap::new());
-    }
+    static UID_CACHE: Lazy<Mutex<HashMap<u32, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
     let mut uid_cache = UID_CACHE.lock().unwrap();
     uid_cache
@@ -2267,9 +2323,7 @@ fn display_uname(metadata: &Metadata, config: &Config) -> String {
 
 #[cfg(all(unix, not(target_os = "redox")))]
 fn cached_gid2grp(gid: u32) -> String {
-    lazy_static! {
-        static ref GID_CACHE: Mutex<HashMap<u32, String>> = Mutex::new(HashMap::new());
-    }
+    static GID_CACHE: Lazy<Mutex<HashMap<u32, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
     let mut gid_cache = GID_CACHE.lock().unwrap();
     gid_cache
@@ -2505,12 +2559,17 @@ fn display_file_name(
     let mut width = name.width();
 
     if let Some(ls_colors) = &config.color {
-        name = color_name(
-            name,
-            &path.p_buf,
-            path.p_buf.symlink_metadata().ok().as_ref(),
-            ls_colors,
-        );
+        let md = path.md(out);
+        name = if md.is_some() {
+            color_name(name, &path.p_buf, md, ls_colors)
+        } else {
+            color_name(
+                name,
+                &path.p_buf,
+                path.p_buf.symlink_metadata().ok().as_ref(),
+                ls_colors,
+            )
+        };
     }
 
     if config.format != Format::Long && !more_info.is_empty() {
@@ -2551,6 +2610,7 @@ fn display_file_name(
     if config.format == Format::Long
         && path.file_type(out).is_some()
         && path.file_type(out).unwrap().is_symlink()
+        && !path.must_dereference
     {
         if let Ok(target) = path.p_buf.read_link() {
             name.push_str(" -> ");

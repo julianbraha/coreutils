@@ -5,13 +5,15 @@
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
 
+// cSpell:ignore wc wc's
+
 #[macro_use]
 extern crate uucore;
 
 mod count_fast;
 mod countable;
 mod word_count;
-use count_fast::{count_bytes_and_lines_fast, count_bytes_fast};
+use count_fast::{count_bytes_chars_and_lines_fast, count_bytes_fast};
 use countable::WordCountable;
 use unicode_width::UnicodeWidthChar;
 use utf8::{BufReadDecoder, BufReadDecoderError};
@@ -26,10 +28,10 @@ use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use uucore::display::{Quotable, Quoted};
 use uucore::error::{UError, UResult, USimpleError};
+use uucore::quoting_style::{escape_name, QuotingStyle};
 
 /// The minimum character width for formatting counts when reading from stdin.
 const MINIMUM_WIDTH: usize = 7;
@@ -40,16 +42,31 @@ struct Settings {
     show_lines: bool,
     show_words: bool,
     show_max_line_length: bool,
+    files0_from_stdin_mode: bool,
+    title_quoting_style: QuotingStyle,
 }
 
 impl Settings {
     fn new(matches: &ArgMatches) -> Self {
+        let title_quoting_style = QuotingStyle::Shell {
+            escape: true,
+            always_quote: false,
+            show_control: false,
+        };
+
+        let files0_from_stdin_mode = match matches.value_of(options::FILES0_FROM) {
+            Some(files_0_from) => files_0_from == STDIN_REPR,
+            None => false,
+        };
+
         let settings = Self {
             show_bytes: matches.is_present(options::BYTES),
             show_chars: matches.is_present(options::CHAR),
             show_lines: matches.is_present(options::LINES),
             show_words: matches.is_present(options::WORDS),
             show_max_line_length: matches.is_present(options::MAX_LINE_LENGTH),
+            files0_from_stdin_mode,
+            title_quoting_style,
         };
 
         if settings.show_bytes
@@ -67,6 +84,8 @@ impl Settings {
             show_lines: true,
             show_words: true,
             show_max_line_length: false,
+            files0_from_stdin_mode,
+            title_quoting_style: settings.title_quoting_style,
         }
     }
 
@@ -126,18 +145,20 @@ impl From<&OsStr> for Input {
 
 impl Input {
     /// Converts input to title that appears in stats.
-    fn to_title(&self) -> Option<&Path> {
+    fn to_title(&self, quoting_style: &QuotingStyle) -> Option<String> {
         match self {
-            Input::Path(path) => Some(path),
-            Input::Stdin(StdinKind::Explicit) => Some(STDIN_REPR.as_ref()),
-            Input::Stdin(StdinKind::Implicit) => None,
+            Self::Path(path) => Some(escape_name(&path.clone().into_os_string(), quoting_style)),
+            Self::Stdin(StdinKind::Explicit) => {
+                Some(escape_name(OsStr::new(STDIN_REPR), quoting_style))
+            }
+            Self::Stdin(StdinKind::Implicit) => None,
         }
     }
 
-    fn path_display(&self) -> Quoted<'_> {
+    fn path_display(&self, quoting_style: &QuotingStyle) -> String {
         match self {
-            Input::Path(path) => path.maybe_quote(),
-            Input::Stdin(_) => "standard input".maybe_quote(),
+            Self::Path(path) => escape_name(&path.clone().into_os_string(), quoting_style),
+            Self::Stdin(_) => escape_name(OsStr::new("standard input"), quoting_style),
         }
     }
 }
@@ -151,12 +172,12 @@ enum WcError {
 impl UError for WcError {
     fn code(&self) -> i32 {
         match self {
-            WcError::FilesDisabled(_) | WcError::StdinReprNotAllowed(_) => 1,
+            Self::FilesDisabled(_) | Self::StdinReprNotAllowed(_) => 1,
         }
     }
 
     fn usage(&self) -> bool {
-        matches!(self, WcError::FilesDisabled(_))
+        matches!(self, Self::FilesDisabled(_))
     }
 }
 
@@ -165,7 +186,7 @@ impl Error for WcError {}
 impl Display for WcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WcError::FilesDisabled(message) | WcError::StdinReprNotAllowed(message) => {
+            Self::FilesDisabled(message) | Self::StdinReprNotAllowed(message) => {
                 write!(f, "{}", message)
             }
         }
@@ -285,29 +306,96 @@ fn word_count_from_reader<T: WordCountable>(
     mut reader: T,
     settings: &Settings,
 ) -> (WordCount, Option<io::Error>) {
-    let only_count_bytes = settings.show_bytes
-        && (!(settings.show_chars
-            || settings.show_lines
-            || settings.show_max_line_length
-            || settings.show_words));
-    if only_count_bytes {
-        let (bytes, error) = count_bytes_fast(&mut reader);
-        return (
-            WordCount {
-                bytes,
-                ..WordCount::default()
-            },
-            error,
-        );
+    match (
+        settings.show_bytes,
+        settings.show_chars,
+        settings.show_lines,
+        settings.show_max_line_length,
+        settings.show_words,
+    ) {
+        // Specialize scanning loop to improve the performance.
+        (false, false, false, false, false) => unreachable!(),
+
+        (true, false, false, false, false) => {
+            // Fast path when only show_bytes is true.
+            let (bytes, error) = count_bytes_fast(&mut reader);
+            (
+                WordCount {
+                    bytes,
+                    ..WordCount::default()
+                },
+                error,
+            )
+        }
+
+        // Fast paths that can be computed without Unicode decoding.
+        (false, false, true, false, false) => {
+            count_bytes_chars_and_lines_fast::<_, false, false, true>(&mut reader)
+        }
+        (false, true, false, false, false) => {
+            count_bytes_chars_and_lines_fast::<_, false, true, false>(&mut reader)
+        }
+        (false, true, true, false, false) => {
+            count_bytes_chars_and_lines_fast::<_, false, true, true>(&mut reader)
+        }
+        (true, false, true, false, false) => {
+            count_bytes_chars_and_lines_fast::<_, true, false, true>(&mut reader)
+        }
+        (true, true, false, false, false) => {
+            count_bytes_chars_and_lines_fast::<_, true, true, false>(&mut reader)
+        }
+        (true, true, true, false, false) => {
+            count_bytes_chars_and_lines_fast::<_, true, true, true>(&mut reader)
+        }
+
+        (_, false, false, false, true) => {
+            word_count_from_reader_specialized::<_, false, false, false, true>(reader)
+        }
+        (_, false, false, true, false) => {
+            word_count_from_reader_specialized::<_, false, false, true, false>(reader)
+        }
+        (_, false, false, true, true) => {
+            word_count_from_reader_specialized::<_, false, false, true, true>(reader)
+        }
+        (_, false, true, false, true) => {
+            word_count_from_reader_specialized::<_, false, true, false, true>(reader)
+        }
+        (_, false, true, true, false) => {
+            word_count_from_reader_specialized::<_, false, true, true, false>(reader)
+        }
+        (_, false, true, true, true) => {
+            word_count_from_reader_specialized::<_, false, true, true, true>(reader)
+        }
+        (_, true, false, false, true) => {
+            word_count_from_reader_specialized::<_, true, false, false, true>(reader)
+        }
+        (_, true, false, true, false) => {
+            word_count_from_reader_specialized::<_, true, false, true, false>(reader)
+        }
+        (_, true, false, true, true) => {
+            word_count_from_reader_specialized::<_, true, false, true, true>(reader)
+        }
+        (_, true, true, false, true) => {
+            word_count_from_reader_specialized::<_, true, true, false, true>(reader)
+        }
+        (_, true, true, true, false) => {
+            word_count_from_reader_specialized::<_, true, true, true, false>(reader)
+        }
+        (_, true, true, true, true) => {
+            word_count_from_reader_specialized::<_, true, true, true, true>(reader)
+        }
     }
+}
 
-    // we do not need to decode the byte stream if we're only counting bytes/newlines
-    let decode_chars = settings.show_chars || settings.show_words || settings.show_max_line_length;
-
-    if !decode_chars {
-        return count_bytes_and_lines_fast(&mut reader);
-    }
-
+fn word_count_from_reader_specialized<
+    T: WordCountable,
+    const SHOW_CHARS: bool,
+    const SHOW_LINES: bool,
+    const SHOW_MAX_LINE_LENGTH: bool,
+    const SHOW_WORDS: bool,
+>(
+    reader: T,
+) -> (WordCount, Option<io::Error>) {
     let mut total = WordCount::default();
     let mut reader = BufReadDecoder::new(reader.buffered());
     let mut in_word = false;
@@ -317,7 +405,7 @@ fn word_count_from_reader<T: WordCountable>(
         match chunk {
             Ok(text) => {
                 for ch in text.chars() {
-                    if settings.show_words {
+                    if SHOW_WORDS {
                         if ch.is_whitespace() {
                             in_word = false;
                         } else if ch.is_ascii_control() {
@@ -327,7 +415,7 @@ fn word_count_from_reader<T: WordCountable>(
                             total.words += 1;
                         }
                     }
-                    if settings.show_max_line_length {
+                    if SHOW_MAX_LINE_LENGTH {
                         match ch {
                             '\n' | '\r' | '\x0c' => {
                                 total.max_line_length = max(current_len, total.max_line_length);
@@ -342,10 +430,10 @@ fn word_count_from_reader<T: WordCountable>(
                             }
                         }
                     }
-                    if settings.show_lines && ch == '\n' {
+                    if SHOW_LINES && ch == '\n' {
                         total.lines += 1;
                     }
-                    if settings.show_chars {
+                    if SHOW_CHARS {
                         total.chars += 1;
                     }
                 }
@@ -417,8 +505,16 @@ fn word_count_from_input(input: &Input, settings: &Settings) -> CountResult {
 ///
 /// Otherwise, the file sizes in the file metadata are summed and the number of
 /// digits in that total size is returned as the number width
+///
+/// To mirror GNU wc's behavior a special case is added. If --files0-from is
+/// used and input is read from stdin and there is only one calculation enabled
+/// columns will not be aligned. This is not exactly GNU wc's behavior, but it
+/// is close enough to pass the GNU test suite.
 fn compute_number_width(inputs: &[Input], settings: &Settings) -> usize {
-    if inputs.is_empty() || (inputs.len() == 1 && settings.number_enabled() == 1) {
+    if inputs.is_empty()
+        || (inputs.len() == 1 && settings.number_enabled() == 1)
+        || (settings.files0_from_stdin_mode && settings.number_enabled() == 1)
+    {
         return 1;
     }
 
@@ -458,29 +554,34 @@ fn wc(inputs: &[Input], settings: &Settings) -> UResult<()> {
             CountResult::Interrupted(word_count, error) => {
                 show!(USimpleError::new(
                     1,
-                    format!("{}: {}", input.path_display(), error)
+                    format!(
+                        "{}: {}",
+                        input.path_display(&settings.title_quoting_style),
+                        error
+                    )
                 ));
                 word_count
             }
             CountResult::Failure(error) => {
                 show!(USimpleError::new(
                     1,
-                    format!("{}: {}", input.path_display(), error)
+                    format!(
+                        "{}: {}",
+                        input.path_display(&settings.title_quoting_style),
+                        error
+                    )
                 ));
                 continue;
             }
         };
         total_word_count += word_count;
-        let result = word_count.with_title(input.to_title());
+        let result = word_count.with_title(input.to_title(&settings.title_quoting_style));
         if let Err(err) = print_stats(settings, &result, number_width) {
             show!(USimpleError::new(
                 1,
                 format!(
                     "failed to print result for {}: {}",
-                    result
-                        .title
-                        .unwrap_or_else(|| "<stdin>".as_ref())
-                        .maybe_quote(),
+                    &result.title.unwrap_or_else(|| String::from("<stdin>")),
                     err,
                 ),
             ));
@@ -488,7 +589,7 @@ fn wc(inputs: &[Input], settings: &Settings) -> UResult<()> {
     }
 
     if num_inputs > 1 {
-        let total_result = total_word_count.with_title(Some("total".as_ref()));
+        let total_result = total_word_count.with_title(Some(String::from("total")));
         if let Err(err) = print_stats(settings, &total_result, number_width) {
             show!(USimpleError::new(
                 1,
@@ -524,9 +625,8 @@ fn print_stats(
     if settings.show_max_line_length {
         columns.push(format!("{:1$}", result.count.max_line_length, number_width));
     }
-
-    if let Some(title) = result.title {
-        columns.push(title.maybe_quote().to_string());
+    if let Some(title) = &result.title {
+        columns.push(title.clone());
     }
 
     writeln!(io::stdout().lock(), "{}", columns.join(" "))

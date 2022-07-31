@@ -1,4 +1,5 @@
 #![allow(clippy::missing_safety_doc)]
+#![allow(clippy::extra_unused_lifetimes)]
 
 // This file is part of the uutils coreutils package.
 //
@@ -10,9 +11,6 @@
 
 // spell-checker:ignore (ToDO) ficlone linkgs lstat nlink nlinks pathbuf reflink strs xattrs symlinked
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[macro_use]
-extern crate ioctl_sys;
 #[macro_use]
 extern crate quick_error;
 #[macro_use]
@@ -20,11 +18,7 @@ extern crate uucore;
 
 use uucore::display::Quotable;
 use uucore::format_usage;
-use uucore::fs::FileInformation;
-#[cfg(windows)]
-use winapi::um::fileapi::CreateFileW;
-#[cfg(windows)]
-use winapi::um::fileapi::GetFileInformationByHandle;
+use uucore::fs::{paths_refer_to_same_file, FileInformation};
 
 use std::borrow::Cow;
 
@@ -37,32 +31,24 @@ use std::collections::HashSet;
 use std::env;
 #[cfg(not(windows))]
 use std::ffi::CString;
-#[cfg(windows)]
-use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::{stdin, stdout, Write};
-use std::mem;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf, StripPrefixError};
 use std::str::FromStr;
 use std::string::ToString;
 use uucore::backup_control::{self, BackupMode};
 use uucore::error::{set_exit_code, ExitCode, UClapError, UError, UResult};
-use uucore::fs::{canonicalize, MissingHandling, ResolveMode};
+use uucore::fs::{canonicalize, is_symlink, MissingHandling, ResolveMode};
 use walkdir::WalkDir;
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-ioctl!(write ficlone with 0x94, 9; std::os::raw::c_int);
 
 quick_error! {
     #[derive(Debug)]
@@ -228,6 +214,16 @@ pub struct Options {
     target_dir: Option<String>,
     update: bool,
     verbose: bool,
+}
+
+// From /usr/include/linux/fs.h:
+// #define FICLONE		_IOW(0x94, 9, int)
+#[cfg(any(target_os = "linux", target_os = "android"))]
+// Use a macro as libc::ioctl expects u32 or u64 depending on the arch
+macro_rules! FICLONE {
+    () => {
+        0x40049409
+    };
 }
 
 static ABOUT: &str = "Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.";
@@ -788,59 +784,29 @@ fn preserve_hardlinks(
     #[cfg(not(target_os = "redox"))]
     {
         if !source.is_dir() {
-            unsafe {
-                let inode: u64;
-                let nlinks: u64;
-                #[cfg(unix)]
-                {
-                    let src_path = CString::new(source.as_os_str().to_str().unwrap()).unwrap();
-                    let mut stat = mem::zeroed();
-                    if libc::lstat(src_path.as_ptr(), &mut stat) < 0 {
-                        return Err(format!(
-                            "cannot stat {}: {}",
-                            source.quote(),
-                            std::io::Error::last_os_error()
-                        )
-                        .into());
-                    }
-                    inode = stat.st_ino as u64;
-                    nlinks = stat.st_nlink as u64;
+            let info = match FileInformation::from_path(source, false) {
+                Ok(info) => info,
+                Err(e) => {
+                    return Err(format!("cannot stat {}: {}", source.quote(), e,).into());
                 }
-                #[cfg(windows)]
-                {
-                    let src_path: Vec<u16> = OsStr::new(source).encode_wide().collect();
-                    #[allow(deprecated)]
-                    let stat = mem::uninitialized();
-                    let handle = CreateFileW(
-                        src_path.as_ptr(),
-                        winapi::um::winnt::GENERIC_READ,
-                        winapi::um::winnt::FILE_SHARE_READ,
-                        std::ptr::null_mut(),
-                        0,
-                        0,
-                        std::ptr::null_mut(),
-                    );
-                    if GetFileInformationByHandle(handle, stat) != 0 {
-                        return Err(format!(
-                            "cannot get file information {:?}: {}",
-                            source,
-                            std::io::Error::last_os_error()
-                        )
-                        .into());
-                    }
-                    inode = ((*stat).nFileIndexHigh as u64) << 32 | (*stat).nFileIndexLow as u64;
-                    nlinks = (*stat).nNumberOfLinks as u64;
-                }
+            };
 
-                for hard_link in hard_links.iter() {
-                    if hard_link.1 == inode {
-                        std::fs::hard_link(hard_link.0.clone(), dest).unwrap();
-                        *found_hard_link = true;
-                    }
+            #[cfg(unix)]
+            let inode = info.inode();
+
+            #[cfg(windows)]
+            let inode = info.file_index();
+
+            let nlinks = info.number_of_links();
+
+            for hard_link in hard_links.iter() {
+                if hard_link.1 == inode {
+                    std::fs::hard_link(hard_link.0.clone(), dest).unwrap();
+                    *found_hard_link = true;
                 }
-                if !(*found_hard_link) && nlinks > 1 {
-                    hard_links.push((dest.to_str().unwrap().to_string(), inode));
-                }
+            }
+            if !(*found_hard_link) && nlinks > 1 {
+                hard_links.push((dest.to_str().unwrap().to_string(), inode));
             }
         }
     }
@@ -994,9 +960,7 @@ fn copy_directory(
     }
 
     // if no-dereference is enabled and this is a symlink, copy it as a file
-    if !options.dereference && fs::symlink_metadata(root).unwrap().file_type().is_symlink()
-    // replace by is_symlink in rust>=1.58
-    {
+    if !options.dereference && is_symlink(root) {
         return copy_file(root, target, options, symlinked_files);
     }
 
@@ -1039,8 +1003,6 @@ fn copy_directory(
         .follow_links(options.dereference)
     {
         let p = or_continue!(path);
-        let is_symlink = fs::symlink_metadata(p.path())?.file_type().is_symlink();
-        // replace by is_symlink in rust >=1.58
         let path = current_dir.join(&p.path());
 
         let local_to_root_parent = match root_parent {
@@ -1064,7 +1026,7 @@ fn copy_directory(
         };
 
         let local_to_target = target.join(&local_to_root_parent);
-        if is_symlink && !options.dereference {
+        if is_symlink(p.path()) && !options.dereference {
             copy_link(&path, &local_to_target, symlinked_files)?;
         } else if path.is_dir() && !local_to_target.exists() {
             if target.is_file() {
@@ -1086,7 +1048,7 @@ fn copy_directory(
                     ) {
                         Ok(_) => Ok(()),
                         Err(err) => {
-                            if fs::symlink_metadata(&source)?.file_type().is_symlink() {
+                            if is_symlink(source) {
                                 // silent the error with a symlink
                                 // In case we do --archive, we might copy the symlink
                                 // before the file itself
@@ -1135,12 +1097,19 @@ fn copy_attribute(source: &Path, dest: &Path, attribute: &Attribute) -> CopyResu
     let source_metadata = fs::symlink_metadata(source).context(context)?;
     match *attribute {
         Attribute::Mode => {
-            fs::set_permissions(dest, source_metadata.permissions()).context(context)?;
-            // FIXME: Implement this for windows as well
-            #[cfg(feature = "feat_acl")]
-            exacl::getfacl(source, None)
-                .and_then(|acl| exacl::setfacl(&[dest], &acl, None))
-                .map_err(|err| Error::Error(err.to_string()))?;
+            // The `chmod()` system call that underlies the
+            // `fs::set_permissions()` call is unable to change the
+            // permissions of a symbolic link. In that case, we just
+            // do nothing, since every symbolic link has the same
+            // permissions.
+            if !is_symlink(dest) {
+                fs::set_permissions(dest, source_metadata.permissions()).context(context)?;
+                // FIXME: Implement this for windows as well
+                #[cfg(feature = "feat_acl")]
+                exacl::getfacl(source, None)
+                    .and_then(|acl| exacl::setfacl(&[dest], &acl, None))
+                    .map_err(|err| Error::Error(err.to_string()))?;
+            }
         }
         #[cfg(unix)]
         Attribute::Ownership => {
@@ -1166,11 +1135,13 @@ fn copy_attribute(source: &Path, dest: &Path, attribute: &Attribute) -> CopyResu
             .map_err(Error::Error)?;
         }
         Attribute::Timestamps => {
-            filetime::set_file_times(
-                Path::new(dest),
-                FileTime::from_last_access_time(&source_metadata),
-                FileTime::from_last_modification_time(&source_metadata),
-            )?;
+            let atime = FileTime::from_last_access_time(&source_metadata);
+            let mtime = FileTime::from_last_modification_time(&source_metadata);
+            if is_symlink(dest) {
+                filetime::set_symlink_file_times(dest, atime, mtime)?;
+            } else {
+                filetime::set_file_times(dest, atime, mtime)?;
+            }
         }
         #[cfg(feature = "feat_selinux")]
         Attribute::Context => {
@@ -1226,7 +1197,7 @@ fn symlink_file(
     {
         std::os::windows::fs::symlink_file(source, dest).context(context)?;
     }
-    if let Some(file_info) = FileInformation::from_path(dest, false) {
+    if let Ok(file_info) = FileInformation::from_path(dest, false) {
         symlinked_files.insert(file_info);
     }
     Ok(())
@@ -1244,7 +1215,8 @@ fn backup_dest(dest: &Path, backup_path: &Path) -> CopyResult<PathBuf> {
 }
 
 fn handle_existing_dest(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
-    if paths_refer_to_same_file(source, dest)? {
+    let dereference_to_compare = options.dereference || !is_symlink(source);
+    if paths_refer_to_same_file(source, dest, dereference_to_compare) {
         return Err(format!("{}: same file", context_for(source, dest)).into());
     }
 
@@ -1252,7 +1224,16 @@ fn handle_existing_dest(source: &Path, dest: &Path, options: &Options) -> CopyRe
 
     let backup_path = backup_control::get_backup_path(options.backup, dest, &options.backup_suffix);
     if let Some(backup_path) = backup_path {
-        backup_dest(dest, &backup_path)?;
+        if paths_refer_to_same_file(source, &backup_path, true) {
+            return Err(format!(
+                "backing up {} might destroy source;  {} not copied",
+                dest.quote(),
+                source.quote()
+            )
+            .into());
+        } else {
+            backup_dest(dest, &backup_path)?;
+        }
     }
 
     match options.overwrite {
@@ -1292,10 +1273,7 @@ fn copy_file(
     }
 
     // Fail if dest is a dangling symlink or a symlink this program created previously
-    if fs::symlink_metadata(dest)
-        .map(|m| m.file_type().is_symlink()) // replace by is_symlink in rust>=1.58
-        .unwrap_or(false)
-    {
+    if is_symlink(dest) {
         if FileInformation::from_path(dest, false)
             .map(|info| symlinked_files.contains(&info))
             .unwrap_or(false)
@@ -1306,7 +1284,8 @@ fn copy_file(
                 dest.display()
             )));
         }
-        if options.dereference && !dest.exists() {
+        let copy_contents = options.dereference || !is_symlink(source);
+        if copy_contents && !dest.exists() {
             return Err(Error::Error(format!(
                 "not writing through dangling symlink '{}'",
                 dest.display()
@@ -1337,9 +1316,7 @@ fn copy_file(
     #[cfg(not(unix))]
     let source_is_fifo = false;
 
-    let dest_already_exists_as_symlink = fs::symlink_metadata(&dest)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false);
+    let dest_already_exists_as_symlink = is_symlink(dest);
 
     let dest = if !(source_is_symlink && dest_already_exists_as_symlink) {
         canonicalize(dest, MissingHandling::Missing, ResolveMode::Physical).unwrap()
@@ -1443,10 +1420,7 @@ fn copy_file(
     };
 
     // TODO: implement something similar to gnu's lchown
-    if fs::symlink_metadata(&dest)
-        .map(|meta| !meta.file_type().is_symlink())
-        .unwrap_or(false)
-    {
+    if !is_symlink(&dest) {
         // Here, to match GNU semantics, we quietly ignore an error
         // if a user does not have the correct ownership to modify
         // the permissions of a file.
@@ -1540,12 +1514,12 @@ fn copy_link(
     } else {
         // we always need to remove the file to be able to create a symlink,
         // even if it is writeable.
-        if dest.is_file() {
+        if is_symlink(dest) || dest.is_file() {
             fs::remove_file(dest)?;
         }
         dest.into()
     };
-    symlink_file(&link, &dest, &*context_for(&link, &dest), symlinked_files)
+    symlink_file(&link, &dest, &context_for(&link, &dest), symlinked_files)
 }
 
 /// Copies `source` to `dest` using copy-on-write if possible.
@@ -1567,7 +1541,8 @@ fn copy_on_write_linux(
         .context(context)?;
     match mode {
         ReflinkMode::Always => unsafe {
-            let result = ficlone(dst_file.as_raw_fd(), src_file.as_raw_fd() as *const i32);
+            let result = libc::ioctl(dst_file.as_raw_fd(), FICLONE!(), src_file.as_raw_fd());
+
             if result != 0 {
                 Err(format!(
                     "failed to clone {:?} from {:?}: {}",
@@ -1581,7 +1556,8 @@ fn copy_on_write_linux(
             }
         },
         ReflinkMode::Auto => unsafe {
-            let result = ficlone(dst_file.as_raw_fd(), src_file.as_raw_fd() as *const i32);
+            let result = libc::ioctl(dst_file.as_raw_fd(), FICLONE!(), src_file.as_raw_fd());
+
             if result != 0 {
                 fs::copy(source, dest).context(context)?;
             }
@@ -1679,14 +1655,6 @@ pub fn verify_target_type(target: &Path, target_type: &TargetType) -> CopyResult
 pub fn localize_to_target(root: &Path, source: &Path, target: &Path) -> CopyResult<PathBuf> {
     let local_to_root = source.strip_prefix(&root)?;
     Ok(target.join(&local_to_root))
-}
-
-pub fn paths_refer_to_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
-    // We have to take symlinks and relative paths into account.
-    let pathbuf1 = canonicalize(p1, MissingHandling::Normal, ResolveMode::Logical)?;
-    let pathbuf2 = canonicalize(p2, MissingHandling::Normal, ResolveMode::Logical)?;
-
-    Ok(pathbuf1 == pathbuf2)
 }
 
 pub fn path_has_prefix(p1: &Path, p2: &Path) -> io::Result<bool> {

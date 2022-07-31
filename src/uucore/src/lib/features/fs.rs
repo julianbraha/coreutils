@@ -8,6 +8,8 @@
 
 //! Set of functions to manage files and symlinks
 
+// spell-checker:ignore backport
+
 #[cfg(unix)]
 use libc::{
     mode_t, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_IRGRP,
@@ -15,12 +17,13 @@ use libc::{
     S_IXUSR,
 };
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::Hash;
-use std::io::Error as IOError;
-use std::io::Result as IOResult;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Result as IOResult};
 #[cfg(unix)]
 use std::os::unix::{fs::MetadataExt, io::AsRawFd};
 use std::path::{Component, Path, PathBuf};
@@ -44,29 +47,23 @@ pub struct FileInformation(
 impl FileInformation {
     /// Get information from a currently open file
     #[cfg(unix)]
-    pub fn from_file(file: &impl AsRawFd) -> Option<Self> {
-        if let Ok(x) = nix::sys::stat::fstat(file.as_raw_fd()) {
-            Some(Self(x))
-        } else {
-            None
-        }
+    pub fn from_file(file: &impl AsRawFd) -> IOResult<Self> {
+        let stat = nix::sys::stat::fstat(file.as_raw_fd())?;
+        Ok(Self(stat))
     }
 
     /// Get information from a currently open file
     #[cfg(target_os = "windows")]
-    pub fn from_file(file: &impl AsHandleRef) -> Option<Self> {
-        if let Ok(x) = winapi_util::file::information(file.as_handle_ref()) {
-            Some(Self(x))
-        } else {
-            None
-        }
+    pub fn from_file(file: &impl AsHandleRef) -> IOResult<Self> {
+        let info = winapi_util::file::information(file.as_handle_ref())?;
+        Ok(Self(info))
     }
 
     /// Get information for a given path.
     ///
     /// If `path` points to a symlink and `dereference` is true, information about
     /// the link's target will be returned.
-    pub fn from_path(path: impl AsRef<Path>, dereference: bool) -> Option<Self> {
+    pub fn from_path(path: impl AsRef<Path>, dereference: bool) -> IOResult<Self> {
         #[cfg(unix)]
         {
             let stat = if dereference {
@@ -74,25 +71,21 @@ impl FileInformation {
             } else {
                 nix::sys::stat::lstat(path.as_ref())
             };
-            if let Ok(stat) = stat {
-                Some(Self(stat))
-            } else {
-                None
-            }
+            Ok(Self(stat?))
         }
         #[cfg(target_os = "windows")]
         {
             use std::fs::OpenOptions;
             use std::os::windows::prelude::*;
             let mut open_options = OpenOptions::new();
+            let mut custom_flags = 0;
             if !dereference {
-                open_options.custom_flags(winapi::um::winbase::FILE_FLAG_OPEN_REPARSE_POINT);
+                custom_flags |= winapi::um::winbase::FILE_FLAG_OPEN_REPARSE_POINT;
             }
-            open_options
-                .read(true)
-                .open(path.as_ref())
-                .ok()
-                .and_then(|file| Self::from_file(&file))
+            custom_flags |= winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
+            open_options.custom_flags(custom_flags);
+            let file = open_options.read(true).open(path.as_ref())?;
+            Self::from_file(&file)
         }
     }
 
@@ -106,6 +99,23 @@ impl FileInformation {
         {
             self.0.file_size()
         }
+    }
+
+    #[cfg(windows)]
+    pub fn file_index(&self) -> u64 {
+        self.0.file_index()
+    }
+
+    pub fn number_of_links(&self) -> u64 {
+        #[cfg(unix)]
+        return self.0.st_nlink as u64;
+        #[cfg(windows)]
+        return self.0.number_of_links() as u64;
+    }
+
+    #[cfg(unix)]
+    pub fn inode(&self) -> u64 {
+        self.0.st_ino as u64
     }
 }
 
@@ -141,6 +151,7 @@ impl Hash for FileInformation {
     }
 }
 
+/// resolve a relative path
 pub fn resolve_relative_path(path: &Path) -> Cow<Path> {
     if path.components().all(|e| e != Component::ParentDir) {
         return path.into();
@@ -190,10 +201,12 @@ pub enum ResolveMode {
     Logical,
 }
 
-// copied from https://github.com/rust-lang/cargo/blob/2e4cfc2b7d43328b207879228a2ca7d427d188bb/src/cargo/util/paths.rs#L65-L90
-// both projects are MIT https://github.com/rust-lang/cargo/blob/master/LICENSE-MIT
-// for std impl progress see rfc https://github.com/rust-lang/rfcs/issues/2208
-// replace this once that lands
+/// Normalize a path by removing relative information
+/// For example, convert 'bar/../foo/bar.txt' => 'foo/bar.txt'
+/// copied from `<https://github.com/rust-lang/cargo/blob/2e4cfc2b7d43328b207879228a2ca7d427d188bb/src/cargo/util/paths.rs#L65-L90>`
+/// both projects are MIT `<https://github.com/rust-lang/cargo/blob/master/LICENSE-MIT>`
+/// for std impl progress see rfc `<https://github.com/rust-lang/rfcs/issues/2208>`
+/// replace this once that lands
 pub fn normalize_path(path: &Path) -> PathBuf {
     let mut components = path.components().peekable();
     let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
@@ -221,47 +234,55 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
-fn resolve<P: AsRef<Path>>(original: P) -> Result<PathBuf, (bool, PathBuf, IOError)> {
-    const MAX_LINKS_FOLLOWED: u32 = 255;
-    let mut followed = 0;
-    let mut result = original.as_ref().to_path_buf();
-    let mut symlink_is_absolute = false;
-    let mut first_resolution = None;
+/// Decide whether the given path is a symbolic link.
+///
+/// This function is essentially a backport of the
+/// [`std::path::Path::is_symlink`] function that exists in Rust
+/// version 1.58 and greater. This can be removed when the minimum
+/// supported version of Rust is 1.58.
+pub fn is_symlink<P: AsRef<Path>>(path: P) -> bool {
+    fs::symlink_metadata(path).map_or(false, |m| m.file_type().is_symlink())
+}
 
-    loop {
-        if followed == MAX_LINKS_FOLLOWED {
-            return Err((
-                symlink_is_absolute,
-                // When we hit MAX_LINKS_FOLLOWED we should return the first resolution (that's what GNU does - for whatever reason)
-                first_resolution.unwrap(),
-                Error::new(ErrorKind::InvalidInput, "maximum links followed"),
-            ));
-        }
+fn resolve_symlink<P: AsRef<Path>>(path: P) -> IOResult<Option<PathBuf>> {
+    let result = if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        Some(fs::read_link(&path)?)
+    } else {
+        None
+    };
+    Ok(result)
+}
 
-        match fs::symlink_metadata(&result) {
-            Ok(meta) => {
-                if !meta.file_type().is_symlink() {
-                    break;
-                }
-            }
-            Err(e) => return Err((symlink_is_absolute, result, e)),
-        }
+enum OwningComponent {
+    Prefix(OsString),
+    RootDir,
+    CurDir,
+    ParentDir,
+    Normal(OsString),
+}
 
-        followed += 1;
-        match fs::read_link(&result) {
-            Ok(path) => {
-                result.pop();
-                symlink_is_absolute = path.is_absolute();
-                result.push(path);
-            }
-            Err(e) => return Err((symlink_is_absolute, result, e)),
-        }
-
-        if first_resolution.is_none() {
-            first_resolution = Some(result.clone());
+impl OwningComponent {
+    fn as_os_str(&self) -> &OsStr {
+        match self {
+            Self::Prefix(s) => s.as_os_str(),
+            Self::RootDir => Component::RootDir.as_os_str(),
+            Self::CurDir => Component::CurDir.as_os_str(),
+            Self::ParentDir => Component::ParentDir.as_os_str(),
+            Self::Normal(s) => s.as_os_str(),
         }
     }
-    Ok(result)
+}
+
+impl<'a> From<Component<'a>> for OwningComponent {
+    fn from(comp: Component<'a>) -> Self {
+        match comp {
+            Component::Prefix(_) => Self::Prefix(comp.as_os_str().to_os_string()),
+            Component::RootDir => Self::RootDir,
+            Component::CurDir => Self::CurDir,
+            Component::ParentDir => Self::ParentDir,
+            Component::Normal(s) => Self::Normal(s.to_os_string()),
+        }
+    }
 }
 
 /// Return the canonical, absolute form of a path.
@@ -295,7 +316,7 @@ pub fn canonicalize<P: AsRef<Path>>(
     miss_mode: MissingHandling,
     res_mode: ResolveMode,
 ) -> IOResult<PathBuf> {
-    // Create an absolute path
+    const SYMLINKS_TO_LOOK_FOR_LOOPS: i32 = 20;
     let original = original.as_ref();
     let original = if original.is_absolute() {
         original.to_path_buf()
@@ -303,86 +324,63 @@ pub fn canonicalize<P: AsRef<Path>>(
         let current_dir = env::current_dir()?;
         dunce::canonicalize(current_dir)?.join(original)
     };
-
+    let path = if res_mode == ResolveMode::Logical {
+        normalize_path(&original)
+    } else {
+        original
+    };
+    let mut parts: VecDeque<OwningComponent> = path.components().map(|part| part.into()).collect();
     let mut result = PathBuf::new();
-    let mut parts = vec![];
-
-    // Split path by directory separator; add prefix (Windows-only) and root
-    // directory to final path buffer; add remaining parts to temporary
-    // vector for canonicalization.
-    for part in original.components() {
+    let mut followed_symlinks = 0;
+    let mut visited_files = HashSet::new();
+    while let Some(part) = parts.pop_front() {
         match part {
-            Component::Prefix(_) | Component::RootDir => {
-                result.push(part.as_os_str());
-            }
-            Component::CurDir => (),
-            Component::ParentDir => {
-                if res_mode == ResolveMode::Logical {
-                    parts.pop();
-                } else {
-                    parts.push(part.as_os_str());
-                }
-            }
-            Component::Normal(_) => {
-                parts.push(part.as_os_str());
-            }
-        }
-    }
-
-    // Resolve the symlinks where possible
-    if !parts.is_empty() {
-        for part in parts[..parts.len() - 1].iter() {
-            result.push(part);
-
-            //resolve as we go to handle long relative paths on windows
-            if res_mode == ResolveMode::Physical {
-                result = normalize_path(&result);
-            }
-
-            if res_mode == ResolveMode::None {
+            OwningComponent::Prefix(s) => {
+                result.push(s);
                 continue;
             }
-
-            match resolve(&result) {
-                Err((_, path, e)) => {
-                    if miss_mode == MissingHandling::Missing {
-                        result = path;
-                    } else {
-                        return Err(e);
+            OwningComponent::RootDir | OwningComponent::Normal(..) => {
+                result.push(part.as_os_str());
+            }
+            OwningComponent::CurDir => {}
+            OwningComponent::ParentDir => {
+                result.pop();
+            }
+        }
+        if res_mode == ResolveMode::None {
+            continue;
+        }
+        match resolve_symlink(&result) {
+            Ok(Some(link_path)) => {
+                for link_part in link_path.components().rev() {
+                    parts.push_front(link_part.into());
+                }
+                if followed_symlinks < SYMLINKS_TO_LOOK_FOR_LOOPS {
+                    followed_symlinks += 1;
+                } else {
+                    let file_info =
+                        FileInformation::from_path(&result.parent().unwrap(), false).unwrap();
+                    let mut path_to_follow = PathBuf::new();
+                    for part in &parts {
+                        path_to_follow.push(part.as_os_str());
+                    }
+                    if !visited_files.insert((file_info, path_to_follow)) {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            "Too many levels of symbolic links",
+                        )); // TODO use ErrorKind::FilesystemLoop when stable
                     }
                 }
-                Ok(path) => {
-                    result = path;
-                }
+                result.pop();
             }
-        }
-
-        result.push(parts.last().unwrap());
-
-        if res_mode == ResolveMode::None {
-            return Ok(result);
-        }
-
-        match resolve(&result) {
-            Err((is_absolute, path, err)) => {
-                // If the resolved symlink is an absolute path and non-existent,
-                // `realpath` throws no such file error.
+            Err(e) => {
                 if miss_mode == MissingHandling::Existing
-                    || (err.kind() == ErrorKind::NotFound
-                        && is_absolute
-                        && miss_mode == MissingHandling::Normal)
+                    || (miss_mode == MissingHandling::Normal && !parts.is_empty())
                 {
-                    return Err(err);
-                } else {
-                    result = path;
+                    return Err(e);
                 }
             }
-            Ok(path) => {
-                result = path;
-            }
-        }
-        if res_mode == ResolveMode::Physical {
-            result = normalize_path(&result);
+            _ => {}
         }
     }
     Ok(result)
@@ -398,12 +396,15 @@ pub fn display_permissions(metadata: &fs::Metadata, display_file_type: bool) -> 
 }
 
 #[cfg(unix)]
+/// Display the permissions of a file
+/// On non unix like system, just show '----------'
 pub fn display_permissions(metadata: &fs::Metadata, display_file_type: bool) -> String {
     let mode: mode_t = metadata.mode() as mode_t;
     display_permissions_unix(mode, display_file_type)
 }
 
 #[cfg(unix)]
+/// Display the permissions of a file on a unix like system
 pub fn display_permissions_unix(mode: mode_t, display_file_type: bool) -> String {
     let mut result;
     if display_file_type {
@@ -468,11 +469,10 @@ pub fn display_permissions_unix(mode: mode_t, display_file_type: bool) -> String
     result
 }
 
-// For some programs like install or mkdir, dir/. can be provided
-// Special case to match GNU's behavior:
-// install -d foo/. should work and just create foo/
-// std::fs::create_dir("foo/."); fails in pure Rust
-// See also mkdir.rs for another occurrence of this
+/// For some programs like install or mkdir, dir/. can be provided
+/// Special case to match GNU's behavior:
+/// install -d foo/. should work and just create foo/
+/// std::fs::create_dir("foo/."); fails in pure Rust
 pub fn dir_strip_dot_for_creation(path: &Path) -> PathBuf {
     if path.to_string_lossy().ends_with("/.") {
         // Do a simple dance to strip the "/."
@@ -480,6 +480,54 @@ pub fn dir_strip_dot_for_creation(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+/// Checks if `p1` and `p2` are the same file.
+/// If error happens when trying to get files' metadata, returns false
+pub fn paths_refer_to_same_file<P: AsRef<Path>>(p1: P, p2: P, dereference: bool) -> bool {
+    infos_refer_to_same_file(
+        FileInformation::from_path(p1, dereference),
+        FileInformation::from_path(p2, dereference),
+    )
+}
+
+/// Checks if `p1` and `p2` are the same file information.
+/// If error happens when trying to get files' metadata, returns false
+pub fn infos_refer_to_same_file(
+    info1: IOResult<FileInformation>,
+    info2: IOResult<FileInformation>,
+) -> bool {
+    if let Ok(info1) = info1 {
+        if let Ok(info2) = info2 {
+            return info1 == info2;
+        }
+    }
+    false
+}
+
+/// Converts absolute `path` to be relative to absolute `to` path.
+pub fn make_path_relative_to<P1: AsRef<Path>, P2: AsRef<Path>>(path: P1, to: P2) -> PathBuf {
+    let path = path.as_ref();
+    let to = to.as_ref();
+    let common_prefix_size = path
+        .components()
+        .zip(to.components())
+        .take_while(|(first, second)| first == second)
+        .count();
+    let path_suffix = path
+        .components()
+        .skip(common_prefix_size)
+        .map(|x| x.as_os_str());
+    let mut components: Vec<_> = to
+        .components()
+        .skip(common_prefix_size)
+        .map(|_| Component::ParentDir.as_os_str())
+        .chain(path_suffix)
+        .collect();
+    if components.is_empty() {
+        components.push(Component::CurDir.as_os_str());
+    }
+    components.iter().collect()
 }
 
 #[cfg(test)]

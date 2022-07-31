@@ -1187,7 +1187,6 @@ fn test_install_dir_req_verbose() {
     let at = &scene.fixtures;
 
     let file_1 = "source_file1";
-    let dest_dir = "sub4";
     at.touch(file_1);
     scene
         .ucmd()
@@ -1197,12 +1196,62 @@ fn test_install_dir_req_verbose() {
         .succeeds()
         .stdout_contains("install: creating directory 'sub3'\ninstall: creating directory 'sub3/a'\ninstall: creating directory 'sub3/a/b'\ninstall: creating directory 'sub3/a/b/c'\n'source_file1' -> 'sub3/a/b/c/file'");
 
-    at.mkdir(dest_dir);
+    scene
+        .ucmd()
+        .arg("-t")
+        .arg("sub4/a")
+        .arg("-Dv")
+        .arg(file_1)
+        .succeeds()
+        .stdout_contains("install: creating directory 'sub4'\ninstall: creating directory 'sub4/a'\n'source_file1' -> 'sub4/a/source_file1'");
+
+    at.mkdir("sub5");
     scene
         .ucmd()
         .arg("-Dv")
         .arg(file_1)
-        .arg("sub4/a/b/c/file")
+        .arg("sub5/a/b/c/file")
         .succeeds()
-        .stdout_contains("install: creating directory 'sub4/a'\ninstall: creating directory 'sub4/a/b'\ninstall: creating directory 'sub4/a/b/c'\n'source_file1' -> 'sub4/a/b/c/file'");
+        .stdout_contains("install: creating directory 'sub5/a'\ninstall: creating directory 'sub5/a/b'\ninstall: creating directory 'sub5/a/b/c'\n'source_file1' -> 'sub5/a/b/c/file'");
+}
+
+#[test]
+fn test_install_compare_option() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    let first = "a";
+    let second = "b";
+    at.touch(first);
+    scene
+        .ucmd()
+        .args(&["-Cv", first, second])
+        .succeeds()
+        .stdout_contains(format!("'{}' -> '{}'", first, second));
+    scene
+        .ucmd()
+        .args(&["-Cv", first, second])
+        .succeeds()
+        .no_stdout();
+    scene
+        .ucmd()
+        .args(&["-Cv", "-m0644", first, second])
+        .succeeds()
+        .stdout_contains(format!("removed '{}'\n'{}' -> '{}'", second, first, second));
+    scene
+        .ucmd()
+        .args(&["-Cv", first, second])
+        .succeeds()
+        .stdout_contains(format!("removed '{}'\n'{}' -> '{}'", second, first, second));
+    scene
+        .ucmd()
+        .args(&["-C", "--preserve-timestamps", first, second])
+        .fails()
+        .code_is(1)
+        .stderr_contains("Options --compare and --preserve-timestamps are mutually exclusive");
+    scene
+        .ucmd()
+        .args(&["-C", "--strip", "--strip-program=echo", first, second])
+        .fails()
+        .code_is(1)
+        .stderr_contains("Options --compare and --strip are mutually exclusive");
 }

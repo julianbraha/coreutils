@@ -13,10 +13,11 @@ use crate::options::*;
 use crate::units::{Result, Unit};
 use clap::{crate_version, Arg, ArgMatches, Command};
 use std::io::{BufRead, Write};
+use units::{IEC_BASES, SI_BASES};
 use uucore::display::Quotable;
 use uucore::error::UResult;
-use uucore::format_usage;
 use uucore::ranges::Range;
+use uucore::{format_usage, InvalidEncodingHandling};
 
 pub mod errors;
 pub mod format;
@@ -50,6 +51,12 @@ FIELDS supports cut(1) style field ranges:
   -M   from first to M'th field (inclusive)
   -    all fields
 Multiple fields/ranges can be separated with commas
+
+FORMAT must be suitable for printing one floating-point argument '%f'.
+Optional quote (%'f) will enable --grouping (if supported by current locale).
+Optional width value (%10f) will pad output. Optional zero (%010f) width
+will zero pad the number. Optional negative values (%-10f) will left align.
+Optional precision (%.1f) will override the input determined precision.
 ";
 const USAGE: &str = "{} [OPTION]... [NUMBER]...";
 
@@ -96,14 +103,76 @@ fn parse_unit(s: &str) -> Result<Unit> {
     }
 }
 
+// Parses a unit size. Suffixes are turned into their integer representations. For example, 'K'
+// will return `Ok(1000)`, and '2K' will return `Ok(2000)`.
+fn parse_unit_size(s: &str) -> Result<usize> {
+    let number: String = s.chars().take_while(char::is_ascii_digit).collect();
+    let suffix = &s[number.len()..];
+
+    if number.is_empty() || "0".repeat(number.len()) != number {
+        if let Some(multiplier) = parse_unit_size_suffix(suffix) {
+            if number.is_empty() {
+                return Ok(multiplier);
+            }
+
+            if let Ok(n) = number.parse::<usize>() {
+                return Ok(n * multiplier);
+            }
+        }
+    }
+
+    Err(format!("invalid unit size: {}", s.quote()))
+}
+
+// Parses a suffix of a unit size and returns the corresponding multiplier. For example,
+// the suffix 'K' will return `Some(1000)`, and 'Ki' will return `Some(1024)`.
+//
+// If the suffix is empty, `Some(1)` is returned.
+//
+// If the suffix is unknown, `None` is returned.
+fn parse_unit_size_suffix(s: &str) -> Option<usize> {
+    if s.is_empty() {
+        return Some(1);
+    }
+
+    let suffix = s.chars().next().unwrap();
+
+    if let Some(i) = ['K', 'M', 'G', 'T', 'P', 'E']
+        .iter()
+        .position(|&ch| ch == suffix)
+    {
+        return match s.len() {
+            1 => Some(SI_BASES[i + 1] as usize),
+            2 if s.ends_with('i') => Some(IEC_BASES[i + 1] as usize),
+            _ => None,
+        };
+    }
+
+    None
+}
+
 fn parse_options(args: &ArgMatches) -> Result<NumfmtOptions> {
     let from = parse_unit(args.value_of(options::FROM).unwrap())?;
     let to = parse_unit(args.value_of(options::TO).unwrap())?;
+    let from_unit = parse_unit_size(args.value_of(options::FROM_UNIT).unwrap())?;
+    let to_unit = parse_unit_size(args.value_of(options::TO_UNIT).unwrap())?;
 
-    let transform = TransformOptions { from, to };
+    let transform = TransformOptions {
+        from,
+        from_unit,
+        to,
+        to_unit,
+    };
 
     let padding = match args.value_of(options::PADDING) {
-        Some(s) => s.parse::<isize>().map_err(|err| err.to_string()),
+        Some(s) => s
+            .parse::<isize>()
+            .map_err(|_| s)
+            .and_then(|n| match n {
+                0 => Err(s),
+                _ => Ok(n),
+            })
+            .map_err(|s| format!("invalid padding value {}", s.quote())),
         None => Ok(0),
     }?;
 
@@ -130,6 +199,15 @@ fn parse_options(args: &ArgMatches) -> Result<NumfmtOptions> {
         }],
         v => Range::from_list(v)?,
     };
+
+    let format = match args.value_of(options::FORMAT) {
+        Some(s) => s.parse()?,
+        None => FormatOptions::default(),
+    };
+
+    if format.grouping && to != Unit::None {
+        return Err("grouping cannot be combined with --to".to_string());
+    }
 
     let delimiter = args.value_of(options::DELIMITER).map_or(Ok(None), |arg| {
         if arg.len() == 1 {
@@ -159,12 +237,35 @@ fn parse_options(args: &ArgMatches) -> Result<NumfmtOptions> {
         delimiter,
         round,
         suffix,
+        format,
     })
+}
+
+// If the --format argument and its value are provided separately, they are concatenated to avoid a
+// potential clap error. For example: "--format --%f--" is changed to "--format=--%f--".
+fn concat_format_arg_and_value(args: &[String]) -> Vec<String> {
+    let mut processed_args: Vec<String> = Vec::with_capacity(args.len());
+    let mut iter = args.iter().peekable();
+
+    while let Some(arg) = iter.next() {
+        if arg == "--format" && iter.peek().is_some() {
+            processed_args.push(format!("--format={}", iter.peek().unwrap()));
+            iter.next();
+        } else {
+            processed_args.push(arg.to_string());
+        }
+    }
+
+    processed_args
 }
 
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
-    let matches = uu_app().get_matches_from(args);
+    let args = args
+        .collect_str(InvalidEncodingHandling::Ignore)
+        .accept_any();
+
+    let matches = uu_app().get_matches_from(concat_format_arg_and_value(&args));
 
     let options = parse_options(&matches).map_err(NumfmtError::IllegalArgument)?;
 
@@ -204,9 +305,16 @@ pub fn uu_app<'a>() -> Command<'a> {
         .arg(
             Arg::new(options::FIELD)
                 .long(options::FIELD)
-                .help("replace the numbers in these input fields (default=1) see FIELDS below")
+                .help("replace the numbers in these input fields; see FIELDS below")
                 .value_name("FIELDS")
                 .default_value(options::FIELD_DEFAULT),
+        )
+        .arg(
+            Arg::new(options::FORMAT)
+                .long(options::FORMAT)
+                .help("use printf style floating-point FORMAT; see FORMAT below for details")
+                .takes_value(true)
+                .value_name("FORMAT"),
         )
         .arg(
             Arg::new(options::FROM)
@@ -216,11 +324,25 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .default_value(options::FROM_DEFAULT),
         )
         .arg(
+            Arg::new(options::FROM_UNIT)
+                .long(options::FROM_UNIT)
+                .help("specify the input unit size")
+                .value_name("N")
+                .default_value(options::FROM_UNIT_DEFAULT),
+        )
+        .arg(
             Arg::new(options::TO)
                 .long(options::TO)
                 .help("auto-scale output numbers to UNITs; see UNIT below")
                 .value_name("UNIT")
                 .default_value(options::TO_DEFAULT),
+        )
+        .arg(
+            Arg::new(options::TO_UNIT)
+                .long(options::TO_UNIT)
+                .help("the output unit size")
+                .value_name("N")
+                .default_value(options::TO_UNIT_DEFAULT),
         )
         .arg(
             Arg::new(options::PADDING)
@@ -249,7 +371,7 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .long(options::ROUND)
                 .help(
                     "use METHOD for rounding when scaling; METHOD can be: up,\
-                    down, from-zero (default), towards-zero, nearest",
+                    down, from-zero, towards-zero, nearest",
                 )
                 .value_name("METHOD")
                 .default_value("from-zero")
@@ -273,7 +395,10 @@ pub fn uu_app<'a>() -> Command<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_buffer, NumfmtOptions, Range, RoundMethod, TransformOptions, Unit};
+    use super::{
+        handle_buffer, parse_unit_size, parse_unit_size_suffix, FormatOptions, NumfmtOptions,
+        Range, RoundMethod, TransformOptions, Unit,
+    };
     use std::io::{BufReader, Error, ErrorKind, Read};
     struct MockBuffer {}
 
@@ -287,7 +412,9 @@ mod tests {
         NumfmtOptions {
             transform: TransformOptions {
                 from: Unit::None,
+                from_unit: 1,
                 to: Unit::None,
+                to_unit: 1,
             },
             padding: 10,
             header: 1,
@@ -295,6 +422,7 @@ mod tests {
             delimiter: None,
             round: RoundMethod::Nearest,
             suffix: None,
+            format: FormatOptions::default(),
         }
     }
 
@@ -330,5 +458,36 @@ mod tests {
         let input_value = b"165\n100\n300\n500";
         let result = handle_buffer(BufReader::new(&input_value[..]), &get_valid_options());
         assert!(result.is_ok(), "did not return Ok for valid input");
+    }
+
+    #[test]
+    fn test_parse_unit_size() {
+        assert_eq!(1, parse_unit_size("1").unwrap());
+        assert_eq!(1, parse_unit_size("01").unwrap());
+        assert!(parse_unit_size("1.1").is_err());
+        assert!(parse_unit_size("0").is_err());
+        assert!(parse_unit_size("-1").is_err());
+        assert!(parse_unit_size("A").is_err());
+        assert!(parse_unit_size("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn test_parse_unit_size_with_suffix() {
+        assert_eq!(1000, parse_unit_size("K").unwrap());
+        assert_eq!(1024, parse_unit_size("Ki").unwrap());
+        assert_eq!(2000, parse_unit_size("2K").unwrap());
+        assert_eq!(2048, parse_unit_size("2Ki").unwrap());
+        assert!(parse_unit_size("0K").is_err());
+    }
+
+    #[test]
+    fn test_parse_unit_size_suffix() {
+        assert_eq!(1, parse_unit_size_suffix("").unwrap());
+        assert_eq!(1000, parse_unit_size_suffix("K").unwrap());
+        assert_eq!(1024, parse_unit_size_suffix("Ki").unwrap());
+        assert_eq!(1000 * 1000, parse_unit_size_suffix("M").unwrap());
+        assert_eq!(1024 * 1024, parse_unit_size_suffix("Mi").unwrap());
+        assert!(parse_unit_size_suffix("Kii").is_none());
+        assert!(parse_unit_size_suffix("A").is_none());
     }
 }

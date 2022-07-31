@@ -432,15 +432,15 @@ enum DuError {
 impl Display for DuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DuError::InvalidMaxDepthArg(s) => write!(f, "invalid maximum depth {}", s.quote()),
-            DuError::SummarizeDepthConflict(s) => {
+            Self::InvalidMaxDepthArg(s) => write!(f, "invalid maximum depth {}", s.quote()),
+            Self::SummarizeDepthConflict(s) => {
                 write!(
                     f,
                     "summarizing conflicts with --max-depth={}",
                     s.maybe_quote()
                 )
             }
-            DuError::InvalidTimeStyleArg(s) => write!(
+            Self::InvalidTimeStyleArg(s) => write!(
                 f,
                 "invalid argument {} for 'time style'
 Valid arguments are:
@@ -451,13 +451,13 @@ Try '{} --help' for more information.",
                 s.quote(),
                 uucore::execution_phrase()
             ),
-            DuError::InvalidTimeArg(s) => write!(
+            Self::InvalidTimeArg(s) => write!(
                 f,
                 "Invalid argument {} for --time.
 'birth' and 'creation' arguments are not supported on this platform.",
                 s.quote()
             ),
-            DuError::InvalidGlob(s) => write!(f, "Invalid exclude syntax: {}", s),
+            Self::InvalidGlob(s) => write!(f, "Invalid exclude syntax: {}", s),
         }
     }
 }
@@ -748,9 +748,9 @@ pub fn uu_app<'a>() -> Command<'a> {
             Arg::new(options::APPARENT_SIZE)
                 .long(options::APPARENT_SIZE)
                 .help(
-                    "print apparent sizes,  rather  than  disk  usage \
-                    although  the apparent  size is usually smaller, it may be larger due to holes \
-                    in ('sparse') files, internal  fragmentation,  indirect  blocks, and the like"
+                    "print apparent sizes, rather than disk usage \
+                    although the apparent size is usually smaller, it may be larger due to holes \
+                    in ('sparse') files, internal fragmentation, indirect blocks, and the like"
                 )
         )
         .arg(
@@ -759,8 +759,8 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .long(options::BLOCK_SIZE)
                 .value_name("SIZE")
                 .help(
-                    "scale sizes  by  SIZE before printing them. \
-                    E.g., '-BM' prints sizes in units of 1,048,576 bytes.  See SIZE format below."
+                    "scale sizes by SIZE before printing them. \
+                    E.g., '-BM' prints sizes in units of 1,048,576 bytes. See SIZE format below."
                 )
         )
         .arg(
@@ -898,7 +898,7 @@ pub fn uu_app<'a>() -> Command<'a> {
                 .possible_values(&["atime", "access", "use", "ctime", "status", "birth", "creation"])
                 .help(
                     "show time of the last modification of any file in the \
-                    directory, or any of its subdirectories.  If WORD is given, show time as WORD instead \
+                    directory, or any of its subdirectories. If WORD is given, show time as WORD instead \
                     of modification time: atime, access, use, ctime, status, birth or creation"
                 )
         )
